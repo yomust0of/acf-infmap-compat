@@ -29,6 +29,7 @@ if SERVER then
 	AddCSLuaFile("acf_infmap_compat/cl_replay.lua")
 	AddCSLuaFile("acf_infmap_compat/cl_bullets.lua")
 	AddCSLuaFile("acf_infmap_compat/cl_render.lua")
+	AddCSLuaFile("acf_infmap_compat/cl_origin.lua")
 	AddCSLuaFile("acf_infmap_compat/cl_menu.lua")
 end
 
@@ -44,18 +45,25 @@ end
 include("acf_infmap_compat/sh_core.lua")
 
 if SERVER then
+	include("acf_infmap_compat/sv_config.lua")
 	include("acf_infmap_compat/sv_sounds.lua")
 	include("acf_infmap_compat/sv_traces.lua")
+	include("acf_infmap_compat/sv_wire.lua")
+	include("acf_infmap_compat/sv_e2ranger.lua")
 	include("acf_infmap_compat/sv_bullets.lua")
 	include("acf_infmap_compat/sv_effects.lua")
 	include("acf_infmap_compat/sv_settings.lua")
 	include("acf_infmap_compat/sv_visclip.lua")
+
+	-- every module has declared its section of config.lua by now
+	Compat.LoadConfig()
 else
 	include("acf_infmap_compat/cl_sounds.lua")
 	include("acf_infmap_compat/cl_effects.lua")
 	include("acf_infmap_compat/cl_replay.lua")
 	include("acf_infmap_compat/cl_bullets.lua")
 	include("acf_infmap_compat/cl_render.lua")
+	include("acf_infmap_compat/cl_origin.lua")
 	include("acf_infmap_compat/cl_menu.lua")
 end
 
@@ -65,3 +73,4 @@ Compat.Install()
 
 hook.Add("ACF_OnLoadAddon", "ACFInfMapCompat", Compat.Install)
 hook.Add("Initialize", "ACFInfMapCompat", Compat.Install)
+hook.Add("InitPostEntity", "ACFInfMapCompat", Compat.Install) -- scripted entities (Wire's) are registered by then

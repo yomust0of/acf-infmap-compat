@@ -187,8 +187,9 @@ local function Nudge(Start, Dir, Length, T, NextT, X, Y, Z, Half, Full)
 end
 
 --- Cuts Start->End at chunk borders. Returns nil when the line stays in one chunk, otherwise a list of
---- {Start, End, T0, T1} that follow each other without gaps.
-local function SplitSegment(Start, End)
+--- {Start, End, T0, T1} that follow each other without gaps. `Limit` = most pieces (default MaxPieces); the rest of the line
+--- after that many is traced as one piece.
+local function SplitSegment(Start, End, Limit)
 	local Half, Full = Compat.ChunkSizes()
 	local SX, SY, SZ = Index(Start, Half, Full)
 	local EX, EY, EZ = Index(End, Half, Full)
@@ -226,7 +227,7 @@ local function SplitSegment(Start, End)
 	local LastX, LastY, LastZ = SX, SY, SZ
 
 	for I, Time in ipairs(Times) do
-		if #Starts >= MaxPieces then break end
+		if #Starts >= (Limit or MaxPieces) then break end
 
 		local NextT = Times[I + 1] or 1
 		local Mid   = Start + Dir * ((Time + NextT) * 0.5)
@@ -276,10 +277,10 @@ local function Fill(Data, Result)
 	return Result
 end
 
-local function ScopedTraceLine(Data)
+local function ScopedTraceLine(Data, Limit)
 	if not (istable(Data) and isvector(Data.start) and isvector(Data.endpos)) then return Underlying(Data) end
 
-	local Pieces = SplitSegment(Data.start, Data.endpos)
+	local Pieces = SplitSegment(Data.start, Data.endpos, Limit)
 
 	if not Pieces then
 		Compat.LastPieces = 1
@@ -322,6 +323,39 @@ function Compat.TraceLine(Data)
 	Underlying = util.TraceLine
 
 	return ScopedTraceLine(Data)
+end
+
+local FarCeiling = 100 -- chunks: no long trace reaches farther than this many chunk widths, whatever the caller asks for
+local PieceCeiling = 64
+
+--- A chunk-aware trace of a LONG line (a camera's aim line, a rangefinder), traced piece by piece through the chunks it crosses.
+--- The line is first cut to `MaxLength` units (a line of 999999999 units is never traced whole), then traced like ACF.trace
+--- traces a bullet, with as many pieces as the length needs. A hit on a clone becomes a hit on the real prop.
+--- Fraction and StartPos refer to the line that was traced (the cut line), HitPos of a miss is its end.
+--- @param Under function The trace function to call for each piece: util.TraceLine as it was BEFORE the caller swapped it
+--- @param Data table The trace data, as given to util.TraceLine
+--- @param MaxLength number? Units; nil = the line as given (up to the ceiling)
+--- @return table # the trace result (also copied into Data.output when there is one)
+function Compat.TraceFar(Under, Data, MaxLength)
+	if not (istable(Data) and isvector(Data.start) and isvector(Data.endpos)) or not Fix:GetBool() then return Under(Data) end
+
+	local _, Full = Compat.ChunkSizes()
+	local Ceiling = Full * FarCeiling
+	local Start   = Data.start
+	local Offset  = Data.endpos - Start
+	local Length  = Offset:Length()
+	local Cut     = Data
+
+	MaxLength = math.min(MaxLength or Ceiling, Ceiling)
+
+	if Length > MaxLength then
+		Cut = CopyData(Data, Start, Start + Offset * (MaxLength / Length), Data.filter)
+		Length = MaxLength
+	end
+
+	Underlying = Under
+
+	return Fill(Data, ScopedTraceLine(Cut, math.min(PieceCeiling, 3 * math.ceil(Length / Full) + 4)))
 end
 
 Compat.Register("sv_traces", function()
@@ -387,7 +421,7 @@ concommand.Add("acf_infmap_tracedebug", function(Ply, _, Args)
 	local function Say(...)
 		local Text = string.format(...)
 
-		if IsValid(Ply) then Ply:PrintMessage(HUD_PRINTCONSOLE, Text .. "\n") else print(Text) end
+		Compat.Tell(Ply, Text)
 	end
 
 	if not IsValid(Ply) then return Say("[ACF-InfMap] tracedebug needs a player to aim from: run it from your own console.") end

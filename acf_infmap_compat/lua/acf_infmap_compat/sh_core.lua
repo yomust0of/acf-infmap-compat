@@ -21,9 +21,7 @@ Compat.StatusLines = Compat.StatusLines or {} -- [Module] = function returning e
 local Stats = Compat.Stats
 
 for _, Name in ipairs({"Swapped", "Skipped", "Split", "OutputCopied", "Killed", "EffectsSent", "EffectsShown", "EffectsDropped",
-                       "EntityFixed", "EntityMissing", "BulletsKeptAlive", "BulletRefused", "BulletNeverDrawn",
-                       "ReplayShown", "ReplayDropped", "ReplayEmpty", "ReplayErrors", "ReplayParticles", "ReplayCorrected",
-                       "BulletEndRange", "BulletEndHit", "BulletEndOther", "ShotsReported", "ShotsNotPrinted", "TracersForced"}) do
+                       "BulletsKeptAlive", "ReplayShown", "ReplayDropped", "ReplayEmpty", "ReplayErrors", "ReplayParticles", "ReplayCorrected", "WireTraces", "E2Traces", "OriginCalls", "OriginErrors"}) do
 	Stats[Name] = Stats[Name] or 0
 end
 
@@ -52,7 +50,6 @@ Compat.ServerSettings = {
 	{Name = "acf_infmap_fix_sounds",      Kind = "bool", Label = "Fix ACF sounds"},
 	{Name = "acf_infmap_sound_range",     Kind = "num", Min = 1000, Max = 400000, Unit = "m", Factor = Compat.MeterToUnit, Label = "Sound range (metres)"},
 	{Name = "acf_infmap_fix_traces",      Kind = "bool", Label = "Chunk-aware bullet traces"},
-	{Name = "acf_infmap_bullet_lifetime", Kind = "num", Min = 0, Max = 3600, Label = "Stray bullet lifetime (seconds, 0 = never remove)"},
 	{Name = "acf_infmap_fix_effects",     Kind = "bool", Label = "Send ACF effects with exact positions"},
 	{Name = "acf_infmap_effect_range",    Kind = "num", Min = 1000, Max = 400000, Unit = "m", Factor = Compat.MeterToUnit, Label = "Effect range (metres): who is sent effects"},
 	{Name = "acf_infmap_fix_visclip",     Kind = "bool", Label = "Resend visual clips to props whose clips a client missed"},
@@ -78,6 +75,44 @@ end
 
 function Compat.Say(...)
 	MsgC(Cyan, "[ACF-InfMap] ", color_white, Join(...) .. "\n")
+end
+
+-- SEEN (play-test 6.7): "DLL_MessageEnd: Refusing to send user message TextMsg of 256 bytes to client, user message size limit is 255
+-- bytes". Ply:PrintMessage is one user message, so a longer line is DROPPED, not cut: `acf_infmap_status` on the server lost its whole
+-- "counters:" line (411 bytes even when every counter is 0). Every line a command prints to a player goes through Compat.Tell.
+Compat.TellLimit = 200
+
+--- Prints one line to a player's console, in pieces that fit a user message. A piece ends at a space or a comma when there is one in
+--- its second half, and never inside a UTF-8 character. Without a player (the server console, or a client) it is a plain print.
+--- @param Ply Player? The player to print to
+--- @param Text string One line, without a newline
+function Compat.Tell(Ply, Text)
+	if not (SERVER and IsValid(Ply)) then return print(Text) end
+
+	local Limit, Pos, Length = Compat.TellLimit, 1, #Text
+
+	while Length - Pos + 1 > Limit do
+		local Cut  = Pos + Limit - 1
+		local Soft = Cut
+
+		while Soft > Pos + Limit * 0.5 and not string.find(string.sub(Text, Soft, Soft), "[ ,]") do Soft = Soft - 1 end
+
+		if Soft > Pos + Limit * 0.5 then
+			Cut = Soft
+		else
+			local Next = string.byte(Text, Cut + 1)
+
+			while Cut > Pos and Next and Next >= 0x80 and Next < 0xC0 do
+				Cut  = Cut - 1
+				Next = string.byte(Text, Cut + 1)
+			end
+		end
+
+		Ply:PrintMessage(HUD_PRINTCONSOLE, string.sub(Text, Pos, Cut))
+		Pos = Cut + 1
+	end
+
+	Ply:PrintMessage(HUD_PRINTCONSOLE, string.sub(Text, Pos) .. "\n")
 end
 
 --- Replaces Table[Name] with Make(Original). Safe to call again and again (acf_reload, Lua refresh):
@@ -144,7 +179,7 @@ function Compat.SoundsStepAside(Label)
 	end
 end
 
-local Order = {"sv_sounds", "sv_traces", "sv_bullets", "sv_effects", "sv_settings", "sv_visclip", "cl_sounds", "cl_effects", "cl_replay", "cl_bullets", "cl_render"}
+local Order = {"sv_sounds", "sv_traces", "sv_wire", "sv_e2ranger", "sv_bullets", "sv_effects", "sv_settings", "sv_visclip", "cl_sounds", "cl_effects", "cl_replay", "cl_bullets", "cl_render", "cl_origin"}
 
 --- Runs every installer once ACF's tables exist. One failing module does not stop the others.
 function Compat.Install()
@@ -240,7 +275,7 @@ concommand.Add("acf_infmap_status", function(Ply)
 	end
 
 	for _, Line in ipairs(Lines) do
-		if SERVER and IsValid(Ply) then Ply:PrintMessage(HUD_PRINTCONSOLE, Line .. "\n") else print(Line) end
+		Compat.Tell(Ply, Line)
 	end
 end)
 

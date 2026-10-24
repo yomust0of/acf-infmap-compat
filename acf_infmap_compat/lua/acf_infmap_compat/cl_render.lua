@@ -778,6 +778,14 @@ function Render.EntityLines(Pattern)
 			Wrapped and (Ent.RenderOverride == Ent.ACFInfMapInstalled and "yes, intact" or "yes, REPLACED since") or "no (your own chunk, or not wrapped)",
 			Kind(Ent, Wrapped and Ent.OldRenderOverride or Ent.RenderOverride), (Wrapped and Ent.OldRenderOverride == DrawCtx) and "yes" or "no",
 			Ent.ACFInfMapDraws or 0, Ent.ACFInfMapTranslucentDraws or 0)
+
+		-- cl_origin.lua: is the position the engine keeps for the entity the one the server networked? (a whole chunk of difference
+		-- draws the entity that far from where it is)
+		if Compat.Origin and isfunction(Compat.Origin.Describe) then
+			local OK, Text = pcall(Compat.Origin.Describe, Ent)
+
+			Lines[#Lines + 1] = "    " .. (OK and Text or ("engine position check failed: " .. tostring(Text)))
+		end
 	end
 
 	return Lines

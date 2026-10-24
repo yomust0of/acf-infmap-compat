@@ -16,8 +16,11 @@
 --          no model, and the later hit message finds nothing to update, so no impact either) when that entity is not valid.
 --          The server sets the crate as `EntIndex` (a number: ballistics_sv.lua, `Bullet.Crate = Entity:EntIndex()`).
 --   SEEN:  GMod wiki: CEffectData:SetEntIndex and GetEntIndex are SERVER-only; SetEntity and GetEntity exist on both realms.
---          So a client-made EffectData cannot carry the crate by index. FixEntity sets it with SetEntity, and `EntityFixed`
---          counts the times it was needed.
+--          So a client-made EffectData cannot carry the crate by index. FixEntity sets it with SetEntity.
+--   SEEN (play-test 6.6 and 6.7): the game hands out an EffectData that still holds the values of an earlier effect ("it still held:
+--          Normal, Origin, Scale" was printed by 6.7). The muzzle flash before a shell carries `Entity = gun`, and a shell built from
+--          an EffectData that was not blanked got the GUN as its ammo crate: no tracer, drag 1 (the shell flew off), no filler (no
+--          HE explosion). Every EffectData is therefore blanked (FreshEffect) and the crate is always set explicitly. This fixed it.
 --   SEEN:  ACF simulates every tracer on the client from the Origin it was sent, in ACF.BulletEffect[Index].SimPos
 --          (ballistics_cl.lua, effects/acf_bullet_effect.lua)
 --   SEEN:  chunk-to-chunk frame shift is Full = 2 * InfMap.chunk_size per chunk, from InfMap.unlocalize_vector
@@ -32,8 +35,6 @@ local Fields = Compat.EffectFields
 
 -- Effects that must always be created natively, whatever their position (cl_bullets.lua decides what to do when they are far)
 local SelfManaged = {acf_bullet_effect = true}
-
-local Verbose = CreateClientConVar("acf_infmap_verbose", "0", true, false, "1 = print a line for every ACF effect this client receives from the server.", 0, 1)
 
 local function ReadValue(Kind, Field)
 	if Kind == Tag.Number then
@@ -74,68 +75,58 @@ end
 
 Compat.ToLocalFrame = ToLocalFrame
 
---- Makes sure the effect's entity is the real entity. A server effect carries the entity as an index (`EntIndex`); ACF's tracer
---- effect reads it back with Data:GetEntity(), so the entity has to be set explicitly on a client-made EffectData.
---- @return boolean? # whether GetEntity already returned a valid entity before the fix (nil: the effect has no EntIndex)
---- @return boolean? # whether it does now
+-- The neutral value of every EffectData field (what a brand-new CEffectData holds): 0, a zero vector, a zero angle, no entity
+local Neutral = {
+	Angles = function() return Angle(0, 0, 0) end,
+	Normal = function() return Vector(0, 0, 0) end,
+	Origin = function() return Vector(0, 0, 0) end,
+	Start  = function() return Vector(0, 0, 0) end,
+	Entity = function() return NULL end,
+}
+
+--- An EffectData with every field set to its neutral value, so that only what the server sent ends up in it.
+--- A field is skipped when `Skip` (a table keyed by field name) is about to give it a value anyway.
+--- @param Skip table? Field names that will be set by the caller
+--- @return table # the EffectData
+local function FreshEffect(Skip)
+	local Effect = EffectData()
+
+	for _, Field in ipairs(Fields) do
+		local Set = Effect["Set" .. Field]
+
+		if Set and not (Skip and Skip[Field] ~= nil) then
+			local Make = Neutral[Field]
+
+			pcall(Set, Effect, Make and Make() or 0)
+		end
+	end
+
+	return Effect
+end
+
+Compat.FreshEffect = FreshEffect
+
+--- Sets the effect's entity to the real entity. A server effect carries the entity as an index (`EntIndex`); ACF's tracer effect
+--- reads it back with Data:GetEntity(), so the entity has to be set explicitly on a client-made EffectData. An entity the server
+--- sent as an entity (the `Entity` field, e.g. a muzzle flash) was already set when the fields were applied. When this client does
+--- not know the entity (not streamed in yet) the effect keeps no entity at all, and ACF's bullet effect then gives up on that shell.
 local function FixEntity(Effect, Values)
 	local Index = Values.EntIndex
 
 	if not isnumber(Index) or Index <= 0 then return end
 
-	local Has = false
-
-	if Effect.GetEntity then
-		local OK, Ent = pcall(Effect.GetEntity, Effect)
-
-		Has = OK and IsValid(Ent)
-	end
-
-	if Has then return true, true end
-
 	local Ent = Entity(Index)
 
-	if IsValid(Ent) then
-		Effect:SetEntity(Ent)
-		Stats.EntityFixed = Stats.EntityFixed + 1
-
-		return false, true
-	end
-
-	Stats.EntityMissing = Stats.EntityMissing + 1 -- the client does not know that entity (yet): nothing can be done here
-
-	return false, false
+	if IsValid(Ent) then Effect:SetEntity(Ent) end
 end
 
 Compat.FixEntity = FixEntity
 
--- The last few bullet effects this client received, for `acf_infmap_bulletdebug`. Lives on the addon table.
-Compat.BulletLog = Compat.BulletLog or {}
-
-local LogSize = 12
-
-local function LogBullet(Name, Values, Inside, Before, After, Created)
-	local Log = Compat.BulletLog
-	local Speed
-
-	if isvector(Values.Start) then Speed = Values.Start:Length() * 10 / Compat.MeterToUnit end -- ACF: Flight = Start * 10, units per second
-
-	local Crate = isnumber(Values.EntIndex) and Values.EntIndex > 0 and Entity(Values.EntIndex) or nil
-
-	Log[#Log + 1] = {
-		Time = CurTime(), Name = Name, Index = Values.DamageType, Hit = Values.Scale, Attachment = Values.Attachment, Origin = Values.Origin,
-		Inside = Inside, EntIndex = Values.EntIndex, Before = Before, After = After, Created = Created, Speed = Speed,
-		Crate = (Compat.CrateFacts and IsValid(Crate)) and Compat.CrateFacts(Crate) or nil,
-	}
-
-	if #Log > LogSize then table.remove(Log, 1) end
-end
-
 local Told = {}
 
---- Prints a warning once per kind per session (and always when acf_infmap_verbose is on)
+--- Prints a warning once per kind per session
 function Compat.WarnOnce(Kind, ...)
-	if Told[Kind] and not Verbose:GetBool() then return end
+	if Told[Kind] then return end
 
 	Told[Kind] = true
 	Compat.Warn(...)
@@ -164,7 +155,7 @@ net.Receive("ACFInfMapCompat_Effect", function()
 		Values.Origin = Local
 	end
 
-	local Effect = EffectData()
+	local Effect = FreshEffect(Values)
 
 	for Field, Value in pairs(Values) do
 		local Set = Effect["Set" .. Field]
@@ -172,21 +163,12 @@ net.Receive("ACFInfMapCompat_Effect", function()
 		if Set then Set(Effect, Value) end
 	end
 
-	local Lower  = string.lower(Name)
-	local Before, After = FixEntity(Effect, Values)
-	local IsBullet = SelfManaged[Lower]
-
-	if Verbose:GetBool() then
-		local O = Values.Origin
-
-		print(string.format("[ACF-InfMap] effect %s origin %s inside-window=%s", Name,
-			O and string.format("(%.0f %.0f %.0f)", O.x, O.y, O.z) or "-", tostring(Inside)))
-	end
+	FixEntity(Effect, Values)
 
 	-- Too far out for the engine: ACF's effect code still runs, but its particles are drawn by cl_replay.lua.
 	-- Bullet effects are handled by cl_bullets.lua (the hit message must always reach them: without it the impact at the end
 	-- of the flight has nothing to update).
-	if not Inside and not IsBullet then
+	if not Inside and not SelfManaged[string.lower(Name)] then
 		if Compat.Replay and Compat.Replay.Dispatch(Name, Values, Effect, Allow, Ignore) then return end
 
 		Stats.EffectsDropped = Stats.EffectsDropped + 1
@@ -194,29 +176,9 @@ net.Receive("ACFInfMapCompat_Effect", function()
 		return
 	end
 
-	-- A hit / end-of-flight message ("Update", Scale > 0): remember it, so the life log can say why a bullet ended
-	if IsBullet and (Values.Scale or 0) > 0 and Compat.NoteBulletHit then Compat.NoteBulletHit(Values.DamageType, Values.Scale) end
-
 	util.Effect(Name, Effect, Allow, Ignore)
 
 	Stats.EffectsShown = Stats.EffectsShown + 1
-
-	-- A new bullet (Scale 0) has to exist in ACF's table right after its Init ran, else ACF refused it (Init is synchronous)
-	if IsBullet and (Values.Scale or 0) == 0 and isnumber(Values.DamageType) then
-		local Created = ACF.BulletEffect ~= nil and ACF.BulletEffect[Values.DamageType] ~= nil
-
-		LogBullet(Name, Values, Inside, Before, After, Created)
-
-		if not Created then
-			Stats.BulletRefused = Stats.BulletRefused + 1
-
-			Compat.WarnOnce("refused", "ACF refused a new bullet effect (#", Values.DamageType, "): ",
-				After == false and ("the ammo crate (entity " .. tostring(Values.EntIndex) .. ") is not known to this client.")
-				or "its Init gave up. Run acf_infmap_bulletdebug for the details.")
-		end
-	elseif IsBullet then
-		LogBullet(Name, Values, Inside, Before, After, nil)
-	end
 end)
 
 -- Keeps ACF's own tracer simulation (and the replayed particles) in step with the player's chunk
@@ -247,56 +209,6 @@ hook.Add("ACF_OnTick", "ACFInfMapCompat_BulletFrame", function()
 	end
 
 	LastChunk = Vector(Now.x, Now.y, Now.z)
-end)
-
--- What did this client receive and what is it simulating? The first thing to run if a tracer or a hit effect is missing.
-local function Num(Value) return isnumber(Value) and string.format("%g", Value) or "-" end
-local function Pos(Vec) return isvector(Vec) and string.format("(%.0f %.0f %.0f)", Vec.x, Vec.y, Vec.z) or "-" end
-local function Flag(Value) if Value == nil then return "n/a" end return Value and "yes" or "NO" end
-
-concommand.Add("acf_infmap_bulletdebug", function()
-	print(string.format("[ACF-InfMap] bullet effects this client received (oldest first, last %d). Chunk %s. Time now t=%.1f (if this does not move between two runs, the game was paused)", LogSize, Compat.ChunkText(LocalPlayer()), CurTime()))
-
-	for _, E in ipairs(Compat.BulletLog) do
-		print(string.format("  t=%.1f index=%s hit=%s attachment=%s origin=%s inside-window=%s crate-index=%s crate-valid-before-fix=%s after=%s created=%s speed=%s m/s",
-			E.Time, Num(E.Index), Num(E.Hit), Num(E.Attachment), Pos(E.Origin), Flag(E.Inside), Num(E.EntIndex), Flag(E.Before), Flag(E.After), Flag(E.Created),
-			E.Speed and string.format("%.0f", E.Speed) or "-"))
-
-		if E.Crate then print("      crate: " .. E.Crate) end
-	end
-
-	print("  simulated right now:")
-
-	local Any = false
-
-	for Index, Bullet in pairs(ACF.BulletEffect or {}) do
-		Any = true
-
-		local Effect = Bullet.Effect
-
-		print(string.format("  #%s pos=%s inside-window=%s draws=%s tracer-emitter=%s far=%s effect-valid=%s renders=%s age=%.2fs",
-			tostring(Index), Pos(Bullet.SimPos), Flag(isvector(Bullet.SimPos) and Compat.InWindow(Bullet.SimPos)), Flag(Effect and Effect.DrawEffect and true or false),
-			Flag(Bullet.Tracer ~= nil and IsValid(Bullet.Tracer)), Flag(Effect and Effect.ACFInfMapFar and true or false), Flag(IsValid(Effect)),
-			Num(Effect and Effect.ACFInfMapRenders), Effect and Effect.ACFInfMapBorn and CurTime() - Effect.ACFInfMapBorn or 0))
-
-		print(string.format("      speed %s m/s, model %s at scale %s, crate: %s",
-			isvector(Bullet.SimFlight) and string.format("%.0f", Bullet.SimFlight:Length() / Compat.MeterToUnit) or "-",
-			Effect and Effect.GetModel and tostring(Effect:GetModel()) or "-", Effect and Effect.GetModelScale and Num(Effect:GetModelScale()) or "-",
-			Compat.CrateFacts and Compat.CrateFacts(Bullet.Crate) or "-"))
-	end
-
-	if not Any then print("  (none)") end
-
-	local Ended = Compat.Bullets and Compat.Bullets.Ended or {}
-
-	print("  bullets that stopped being simulated (oldest first, last 12):")
-
-	for _, E in ipairs(Ended) do
-		print(string.format("  #%s lived %.2f s, last position %s%s, engine renders %s, speed %s m/s, ended by: %s - %s",
-			tostring(E.Index), E.Ended - E.Born, Pos(E.Pos), E.Far and " (beyond the window)" or "", Num(E.Renders), E.Speed and string.format("%.0f", E.Speed) or "-", E.Kind, tostring(E.Why)))
-	end
-
-	if #Ended == 0 then print("  (none yet)") end
 end)
 
 Compat.StatusLines.cl_effects = function()

@@ -2,7 +2,7 @@
 --
 -- Two halves:
 --   * YOUR settings (far effects and bullets: on/off, distance, size). Client console variables, saved on your machine.
---   * SERVER settings (sound and effect ranges, the fixes' on/off switches, stray bullet lifetime). Only a superadmin can change
+--   * SERVER settings (sound and effect ranges, the fixes' on/off switches). Only a superadmin can change
 --     them: each change is sent to the server (sv_settings.lua), which checks the sender and the value. Everyone else sees them
 --     as read-only text. Ranges are shown in metres; the console variables themselves hold units (1 m = 39.37 units).
 --
@@ -79,19 +79,13 @@ local function Build(Panel)
 	Panel:NumSlider("Far effect distance (metres)", "acf_infmap_cl_replay_distance", 0, 10000, 0)
 	Panel:NumSlider("Far effect size", "acf_infmap_cl_replay_scale", 0.1, 5, 2)
 	Panel:CheckBox("Keep bullets alive past the engine's limit (needed for impacts far away, and far tracers)", "acf_infmap_cl_bullets")
-	Panel:CheckBox("Draw a bullet's model myself if the engine never does", "acf_infmap_cl_bullet_draw")
-	Panel:CheckBox("Print one console line for every shot when its bullet ends (tracer setting, speed, distances, frames drawn)", "acf_infmap_cl_shot_report")
-	Panel:CheckBox("Give every shell a tracer, even when its crate's Tracer box is off (diagnostic)", "acf_infmap_cl_force_tracer")
 	Panel:Button("Test: explosion 1500 m ahead of you", "acf_infmap_fartest", "1500")
-	Panel:Button("Test: slow ACF shell in front of you", "acf_infmap_bullettest")
-	Panel:Button("Test: fast shell with a forced tracer", "acf_infmap_bullettest", "800", "tracer")
-	Panel:Button("Test: 100 mm shell, 100 m/s, tracer, no crate used", "acf_infmap_bullettest", "100", "100mm", "tracer", "self")
-	Panel:Button("Print what bullets this client received", "acf_infmap_bulletdebug")
 	Panel:CheckBox("Keep visual clips and Prop2Mesh meshes right in other chunks", "acf_infmap_cl_render_fix")
 	Panel:CheckBox("Ask the server for visual clips a prop is missing when it comes into range", "acf_infmap_cl_visclip_resync")
 	Panel:NumSlider("Visual clip check range (chunks)", "acf_infmap_cl_visclip_range", 1, 100, 0)
 	Panel:CheckBox("In other chunks, run scripted entities' own Draw (laser beams, glows, overlays)", "acf_infmap_cl_render_draw")
 	Panel:CheckBox("Correct render boxes that scripted entities in other chunks set in world coordinates (lazers that fire)", "acf_infmap_cl_render_bounds")
+	Panel:CheckBox("Keep the engine position of ACF entities in other chunks right (lazers drawn too far away)", "acf_infmap_cl_origin_fix")
 	Panel:Button("Print what the render fix sees (meshes, clips)", "acf_infmap_renderdebug")
 	Panel:Button("Print what happens to lazers (any class: type acf_infmap_entdebug <part of the name>)", "acf_infmap_entdebug", "lazer")
 
@@ -101,6 +95,7 @@ local function Build(Panel)
 
 	for _, Def in ipairs(Compat.ServerSettings) do ServerRow(Panel, Def, Admin) end
 
+	Panel:Help("How long a bullet may fly before the server removes it (by caliber) is set in lua/acf_infmap_compat/config.lua on the server.")
 	Panel:Help("The effect range decides who is sent an effect at all. Far effects can only show what the server sent, so keep it at least as large as your far distance (1 km = 1000 m). Three chunks is about 1520 m.")
 end
 

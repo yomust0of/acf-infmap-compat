@@ -203,7 +203,7 @@ concommand.Add("acf_infmap_sounddebug", function(Ply)
 	local function Say(...)
 		local Text = string.format(...)
 
-		if IsValid(Ply) then Ply:PrintMessage(HUD_PRINTCONSOLE, Text .. "\n") else print(Text) end
+		Compat.Tell(Ply, Text)
 	end
 
 	Say("[ACF-InfMap] sounds: fix %s, range = %g units, %d tracked loops", Fix:GetBool() and "ON" or "OFF", Range:GetFloat(), table.Count(Loops))
