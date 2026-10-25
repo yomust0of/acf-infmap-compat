@@ -138,15 +138,18 @@ local function Contextualize(Fn)
 
 	Run = function(Ent, ...)
 		local Me   = LocalPlayer()
-		local Mine = Ent.CHUNK_OFFSET
+		local Mine = IsValid(Me) and Me.CHUNK_OFFSET
+		local MineEnt = Ent.CHUNK_OFFSET
+
+		-- FIX: If we are in the same chunk, do NOT tamper with offsets. Let native handle it.
+		if not (IsValid(Me) and MineEnt) or (Mine and MineEnt == Mine) then 
+			return Fn(Ent, ...) 
+		end
 
 		Ent.ACFInfMapDraws = (Ent.ACFInfMapDraws or 0) + 1
 
-		if not (IsValid(Me) and Mine) then return Fn(Ent, ...) end
-
 		local Saved = Me.CHUNK_OFFSET
-
-		Me.CHUNK_OFFSET = Mine
+		Me.CHUNK_OFFSET = MineEnt
 
 		local OK, Err = pcall(Fn, Ent, ...)
 
@@ -154,8 +157,6 @@ local function Contextualize(Fn)
 
 		if not OK then
 			Stats.RenderContextErrors = Stats.RenderContextErrors + 1
-
-			-- Not re-thrown: InfMap's wrapper would then skip its cam.End3D() and leave the camera stack broken. Reported once.
 			if Stats.RenderContextErrors == 1 then Compat.Warn("An entity's RenderOverride raised an error while it was drawn in another chunk: ", tostring(Err)) end
 		end
 	end
@@ -219,6 +220,15 @@ end
 
 --- Called before InfMap's function: moves a replaced override back where InfMap looks for it, and gives a scripted entity its Draw route.
 local function Before(Ent)
+	local Me = LocalPlayer()
+	local Mine = IsValid(Me) and Me.CHUNK_OFFSET
+	local EntChunk = Ent.CHUNK_OFFSET
+
+	-- If the entity is in our local chunk, skip forcing compatibility overrides entirely
+	if Mine and EntChunk and EntChunk == Mine then
+		return
+	end
+	
 	if Ent.ValidRenderOverride ~= nil then
 		local Installed = Ent.ACFInfMapInstalled
 		local Current   = Ent.RenderOverride
