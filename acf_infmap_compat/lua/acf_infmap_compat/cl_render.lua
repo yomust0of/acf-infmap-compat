@@ -155,7 +155,7 @@ local function Contextualize(Fn)
 		local Mine = IsValid(Me) and Me.CHUNK_OFFSET
 		local MineEnt = Ent.CHUNK_OFFSET
 
-		-- If we are in the same local chunk, skip forcing wrapper offsets entirely
+		-- FIX: If we are in the same local chunk, skip forcing wrapper offsets entirely
 		if not (IsValid(Me) and MineEnt) or (Mine and MineEnt == Mine) then 
 			return Fn(Ent, ...) 
 		end
@@ -163,17 +163,11 @@ local function Contextualize(Fn)
 		Ent.ACFInfMapDraws = (Ent.ACFInfMapDraws or 0) + 1
 
 		local Saved = Me.CHUNK_OFFSET
-		
-		-- Temporarily override chunk offset and set flags so sound hooks know this is visual-only
 		Me.CHUNK_OFFSET = MineEnt
-		Me.ACFInfMapIsRendering = true
-		Me.ACFInfMapRealChunk = Saved
 
 		local OK, Err = pcall(Fn, Ent, ...)
 
 		Me.CHUNK_OFFSET = Saved
-		Me.ACFInfMapIsRendering = nil
-		Me.ACFInfMapRealChunk = nil
 
 		if not OK then
 			Stats.RenderContextErrors = Stats.RenderContextErrors + 1
@@ -465,6 +459,24 @@ local function SweepMeshes()
 end
 
 -- ---------------------------------------------------------------------------------------------------- render bounds
+-- A script that sets its render box in WORLD coordinates (Entity:SetRenderBoundsWS) with positions it got from GetPos, LocalToWorld,
+-- WorldSpaceCenter... gets them in YOUR chunk's frame, because InfMap detours those getters (cl_inf_detours.lua). The engine stores the
+-- box as entity-local bounds, subtracting the entity's REAL position, which is in ITS chunk's frame. In another chunk the stored
+-- local box is therefore off by the chunk difference (20000 units per chunk). InfMap's own code reads that box back
+-- (cl_inf_chunks.lua: `ent.RENDER_BOUNDS = {ent:GetRenderBounds()}`, once, when it first shrinks the entity's bounds) and expects
+-- entity-local extents, because it scales them by sub_size / distance and places them in front of your eye. With the chunk
+-- difference still inside, the shrunk box ends up about twice as far out as InfMap meant, which for a player standing near the
+-- edge of his chunk is outside the +-16384 box that InfMap says the engine does not render.
+-- InfMap detours SetRenderBounds (local coordinates) for this reason; SetRenderBoundsWS is the one it left out.
+--   SEEN:  the acf_lazer of github.com/yomust0of/Acf_LaZers calls SetRenderBoundsWS every Think while it fires, with
+--          self:GetMuzzlePos() (= self:LocalToWorld(...)), so it is exactly this case (cl_init.lua, UpdateBeamBounds).
+--   SEEN:  InfMap calls SetRenderBoundsWS itself every frame, with positions around the EYE (also this frame). Those calls must not
+--          be touched, so this file wraps InfMap's RenderScene hook and ignores every call made while it runs.
+--   SEEN:  sub_size = (source_bounds - chunk_size) / 2 = 3192: the margin InfMap leaves between a chunk's edge and the world box.
+--   GUESS: that the engine really culls an entity whose box is outside the world box (InfMap's comment says it does).
+--   GUESS: that GetRenderBounds on the client returns what SetRenderBoundsWS stored, converted with the entity's raw position.
+-- The conversion is switched on only when InfMap's hook was found and wrapped (Render.BoundsReady), so a different InfMap version
+-- leaves the engine function alone.
 local EntityMT = FindMetaTable("Entity")
 
 local BoundsHook = "!infinite_update_visbounds"
@@ -490,6 +502,7 @@ local function MakeBoundsDetour(Original)
 	end
 end
 
+--- Wraps InfMap's RenderScene hook so that the detour above can tell InfMap's own calls from everybody else's.
 local function WrapBoundsHook()
 	local Set = hook.GetTable and hook.GetTable().RenderScene
 	local Fn  = Set and Set[BoundsHook]
@@ -508,6 +521,7 @@ local function WrapBoundsHook()
 
 			InInfMap = false
 
+			-- Not swallowed: an error in InfMap stays an InfMap error
 			if not OK then error(A, 0) end
 
 			return A, B
@@ -524,6 +538,11 @@ local function WrapBoundsHook()
 	return Render.BoundsReady
 end
 
+-- Separate protected calls: one failing step must not stop the others
+-- The guard comes first: a Prop2Mesh refresh clears its child's override, the guard puts InfMap's wrapper back, and the sweep then
+-- routes that wrapper through Draw, all before anything is drawn. (Since the guard also routes wrapped entities that lack the route,
+-- swapping the two steps reaches the same state in the same frame: the test run with them swapped passes. The order is kept because
+-- it is the one that was reasoned through.)
 local Steps = {
 	{"the override guard", Guard},
 	{"the Prop2Mesh sweep", SweepMeshes},
@@ -557,6 +576,7 @@ local function Wanted(Ent)
 	return not InfMap.filter_entities(Ent)
 end
 
+--- Clientside children of chunked entities that InfMap never saw (not only Prop2Mesh's), and the visual clip resync.
 local function Scan()
 	local LP   = LocalPlayer()
 	local Mine = IsValid(LP) and LP.CHUNK_OFFSET
@@ -570,13 +590,16 @@ local function Scan()
 		local Chunk = Ent.CHUNK_OFFSET
 
 		if Chunk then
+			-- Force visibility flags so high-detail building architecture doesn't vanish up close
 			ForceRenderVisibility(Ent)
 
+			-- Wrapped by InfMap before this file was loaded (so the guard does not know it): take it over, once
 			if Ent.ValidRenderOverride ~= nil and not Ent.ACFInfMapListed then InfMap.prop_update_chunk(Ent, Chunk) end
 
 			if Ask and not Ent.ACFInfMapClipAsked and (Chunk - Mine):LengthSqr() <= Limit and Wanted(Ent) then
 				Ent.ACFInfMapClipAsked = true
 
+				-- A prop that already holds clips (Visual Clip sets MaxClips) needs nothing; asking would only duplicate them
 				if Ent.MaxClips == nil and #Pending < MaxPending then Pending[#Pending + 1] = Ent:EntIndex() end
 			end
 		elseif Ent:EntIndex() == -1 then
@@ -604,6 +627,9 @@ local function Flush()
 	Stats.ClipRequests = Stats.ClipRequests + Count
 end
 
+-- A Prop2Mesh entity is known the moment it is created, so its first mesh is repaired before it is ever drawn. The half-second
+-- scan below is the catch-all (it also drops entities that are gone).
+--   GUESS: that GetClass() already answers inside OnEntityCreated on the client. If it does not, a new entity waits for the scan.
 hook.Add("OnEntityCreated", "ACFInfMapCompat_Render", function(Ent)
 	if IsValid(Ent) and Ent:GetClass() == "sent_prop2mesh" then Render.P2M[#Render.P2M + 1] = Ent end
 end)
@@ -614,7 +640,7 @@ timer.Create("ACFInfMapCompat_RenderSlow", 0.5, 0, function()
 	local OK, Err = pcall(function()
 		Render.P2M = ents.FindByClass("sent_prop2mesh")
 
-		Render.InstallBounds()
+		Render.InstallBounds() -- InfMap may have registered its hook after us, or again (a Lua refresh)
 		Scan()
 		Flush()
 	end)
@@ -622,6 +648,9 @@ timer.Create("ACFInfMapCompat_RenderSlow", 0.5, 0, function()
 	if not OK then Fail("the slow render scan", Err) end
 end)
 
+-- ---------------------------------------------------------------------------------------------------- install
+--- The render box correction: InfMap's hook first (the detour only acts once the hook is wrapped), then the detour. Idempotent, so the
+--- half-second scan calls it too: when InfMap's hook shows up after this file ran, the correction starts then.
 function Render.InstallBounds()
 	if WrapBoundsHook() then
 		Compat.Wrap(EntityMT, "SetRenderBoundsWS", MakeBoundsDetour, "render bounds (Entity:SetRenderBoundsWS)")
@@ -644,6 +673,7 @@ end
 
 Render.Install = Install
 
+-- This module does not need ACF, so it installs itself instead of waiting for Compat.Install
 Install()
 
 hook.Add("Initialize", "ACFInfMapCompat_Render", Install)
@@ -672,6 +702,7 @@ local function Chunks(Ent, Mine)
 	return string.format("%d,%d,%d chunks away", D.x, D.y, D.z)
 end
 
+--- Lines for `acf_infmap_renderdebug`. Exposed for the harness.
 function Render.DebugLines()
 	local Lines = {}
 	local LP    = LocalPlayer()
@@ -682,6 +713,7 @@ function Render.DebugLines()
 	Lines[#Lines + 1] = string.format("you are in chunk %s", Mine and Compat.ChunkText(LP) or "?")
 	Lines[#Lines + 1] = string.format("entities InfMap wrapped and this file watches: %d", #List)
 
+	-- The wrapped entities nearest to you whose override is not plain InfMap
 	local Shown = 0
 
 	for _, Ent in ipairs(List) do
@@ -693,6 +725,7 @@ function Render.DebugLines()
 		end
 	end
 
+	-- Prop2Mesh
 	local Meshes, Wrong, Unwrapped, Total = 0, 0, 0, #Render.P2M
 
 	for _, Ent in ipairs(Render.P2M) do
@@ -729,6 +762,8 @@ concommand.Add("acf_infmap_renderdebug", function()
 	for _, Line in ipairs(Render.DebugLines()) do print("[ACF-InfMap] " .. Line) end
 end)
 
+--- Lines for `acf_infmap_entdebug <part of a class name>`: what this addon and InfMap are doing to the entities of that class (at most
+--- 10, nearest chunk first). Exposed for the harness.
 function Render.EntityLines(Pattern)
 	local Lines   = {}
 	local LP      = LocalPlayer()
@@ -773,6 +808,8 @@ function Render.EntityLines(Pattern)
 			Kind(Ent, Wrapped and Ent.OldRenderOverride or Ent.RenderOverride), (Wrapped and Ent.OldRenderOverride == DrawCtx) and "yes" or "no",
 			Ent.ACFInfMapDraws or 0, Ent.ACFInfMapTranslucentDraws or 0)
 
+		-- cl_origin.lua: is the position the engine keeps for the entity the one the server networked? (a whole chunk of difference
+		-- draws the entity that far from where it is)
 		if Compat.Origin and isfunction(Compat.Origin.Describe) then
 			local OK, Text = pcall(Compat.Origin.Describe, Ent)
 

@@ -8,11 +8,21 @@
 -- Fix: for an entity in a different chunk, play the one-shot at the entity's client-side GetPos(), which InfMap already
 -- converts into the local player's frame. Everything else goes through ACF unchanged. Looping sounds (engines) are not
 -- touched: ACF's CreateSound is already redirected by InfMap to a client prop that follows the entity.
+--
+-- Evidence labels: SEEN = read in source / run in the mock, KNOWN = standard GMod behaviour not re-checked, GUESS = needs a game.
+--   SEEN:  other-chunk entities are not moved: InfMap gives them a RenderOverride that wraps the draw in
+--          cam.Start3D(EyePos() - visual_offset)                                         (infmap/cl_inf_chunks.lua)
+--   SEEN:  client Entity:GetPos() is relative to the local player's chunk                (infmap/cl_inf_detours.lua)
+--   SEEN:  ACF plays entity one-shots with Origin:EmitSound                              (acf/core/utilities/sounds/sounds_cl.lua)
+--   SEEN:  InfMap clamps its own sound props to +-100000 units, which this file copies  (infmap/sh_inf_sound.lua)
+--   KNOWN: EmitSound on an entity uses the entity's engine origin.
+--   GUESS: sound.Play at a position that far from the world origin is audible and correctly placed. InfMap does the same
+--          with its props, so it is plausible, but it has not been heard.
 
 local Compat = ACFInfMapCompat
 local LIMIT  = 100000
 
--- The entity's position in the local player's frame, clamped the way InfMap does[cite: 3]
+-- The entity's position in the local player's frame, clamped the way InfMap does
 local function FramePos(Ent)
 	local Pos = Ent:GetPos()
 
@@ -24,9 +34,7 @@ local function InOtherChunk(Ent)
 
 	if not IsValid(Player) then return false end
 
-	-- Use the real player chunk if we are currently inside a temporary render context swap
-	local PlayerChunk = Player.ACFInfMapIsRendering and Player.ACFInfMapRealChunk or Player.CHUNK_OFFSET
-	local EntChunk = Ent.CHUNK_OFFSET
+	local EntChunk, PlayerChunk = Ent.CHUNK_OFFSET, Player.CHUNK_OFFSET
 
 	return EntChunk ~= nil and PlayerChunk ~= nil and EntChunk ~= PlayerChunk
 end
@@ -47,7 +55,7 @@ Compat.Register("cl_sounds", function()
 	end, "Sounds.PlaySound")
 end)
 
--- `acf_infmap_sounddebug_cl` in your console near a running engine[cite: 3]
+-- `acf_infmap_sounddebug_cl` in your console near a running engine
 concommand.Add("acf_infmap_sounddebug_cl", function()
 	local Player = LocalPlayer()
 
