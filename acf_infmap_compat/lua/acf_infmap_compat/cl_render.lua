@@ -169,7 +169,7 @@ local MaxPerMessage = 255 -- entity indices per request (8 bits for the count)
 local MaxPending    = 8192
 
 -- Counters this file adds to the shared list (sh_core.lua declares them too; this keeps the file usable on its own)
-for _, Name in ipairs({"RenderRescued", "RenderThrottled", "RenderErrors", "RenderContextErrors", "ChildrenAdopted", "MeshRepositioned", "DrawRouted", "ClipRequests", "BoundsConverted"}) do
+for _, Name in ipairs({"RenderRescued", "RenderThrottled", "RenderErrors", "RenderContextErrors", "ChildrenAdopted", "MeshRepositioned", "DrawRouted", "ClipRequests", "BoundsConverted", "RenderStuck", "BoxRepaired"}) do
 	Stats[Name] = Stats[Name] or 0
 end
 
@@ -453,15 +453,28 @@ local function Throttled(Ent)
 	return false
 end
 
---- Re-runs InfMap for every wrapped entity whose RenderOverride was replaced since.
+--- Re-runs InfMap for every wrapped entity whose RenderOverride was replaced since, and for every entity that InfMap still holds
+--- wrapped although it is in YOUR chunk.
+---
+--- The second rule is InfMap's own contract (cl_inf_chunks.lua, prop_update_chunk): an entity in the player's chunk is drawn by the
+--- engine, not through a wrapper that moves the camera by a chunk difference. When the wrapper is still on it, the entity is drawn one
+--- chunk (20000 units) away from where it is, i.e. it is invisible. InfMap restores every entity in one loop when the local player's
+--- chunk changes, and that loop is one unprotected Lua call: an error raised for any entity in it ends the loop, and everything after
+--- that entity keeps its wrapper. GUESS: that this is not what happens in the game; the counter `RenderStuck` (acf_infmap_status) says
+--- how often this rule found something, and `acf_infmap_visdebug` names an example. The rule costs one comparison per watched entity.
 local function Guard()
-	local I = 1
+	local LP   = LocalPlayer()
+	local Mine = IsValid(LP) and LP.CHUNK_OFFSET
+	local I    = 1
 
 	while I <= #List do
 		local Ent = List[I]
 
 		if not IsValid(Ent) or Ent.ValidRenderOverride == nil or not Ent.CHUNK_OFFSET then
-			if IsValid(Ent) then Ent.ACFInfMapListed = nil end
+			if IsValid(Ent) then
+				Ent.ACFInfMapListed     = nil
+				Ent.ACFInfMapStuckTried = nil
+			end
 
 			List[I] = List[#List]
 			List[#List] = nil
@@ -470,8 +483,22 @@ local function Guard()
 			-- loaded after InfMap wrapped it, or the switch was turned on since)
 			local Replaced = Ent.RenderOverride ~= Ent.ACFInfMapInstalled
 			local Unrouted = Ent.ValidRenderOverride == false and Ent.OldRenderOverride == nil and Routable(Ent)
+			local Stuck    = Mine and Ent.CHUNK_OFFSET == Mine
 
-			if (Replaced or Unrouted) and not Throttled(Ent) then
+			-- The one attempt belongs to the situation "in your chunk and still wrapped"; once the entity is seen in another chunk (or
+			-- put right) the next time is a new situation
+			if not Stuck then Ent.ACFInfMapStuckTried = nil end
+
+			Stuck = Stuck and Ent.ACFInfMapStuckTried ~= Mine
+
+			if (Replaced or Unrouted or Stuck) and not Throttled(Ent) then
+				if Stuck then
+					-- One attempt per entity and chunk: if InfMap itself fails on it, asking every frame would not help
+					Ent.ACFInfMapStuckTried = Mine
+					Stats.RenderStuck       = Stats.RenderStuck + 1
+					Render.LastStuck        = string.format("%s #%d", Ent:GetClass(), Ent:EntIndex())
+				end
+
 				InfMap.prop_update_chunk(Ent, Ent.CHUNK_OFFSET)
 			end
 
@@ -553,6 +580,69 @@ local function SweepMeshes()
 					local Child = Info.ent
 
 					if IsValid(Child) then SweepMesh(Info, Child) end
+				end
+			end
+		end
+	end
+end
+
+-- ---------------------------------------------------------------------------------------------------- Prop2Mesh render boxes
+-- InfMap takes the render box of an entity in another chunk away (it shrinks it in front of your eye every frame) and gives it back
+-- when you enter that chunk. What it gives back is the box it copied the first time it shrank it: `ent.RENDER_BOUNDS`
+-- (cl_inf_chunks.lua). InfMap keeps that copy current when the box is changed through Entity:SetRenderBounds, because it detours
+-- that function (cl_inf_detours.lua). A script that changed the box through ANOTHER route after the copy was made (a function it
+-- captured before InfMap's detour existed, or the engine's own function) is not noticed, and walking into the chunk gives back the
+-- old, smaller box. A mesh child of Prop2Mesh has the box of its model, a 47-unit plate, until the mesh data is there; with that box
+-- left, the mesh is drawn only while the plate's own origin is on your screen, which for a vehicle you stand next to is almost never.
+--   SEEN:  Prop2Mesh sets the box of a mesh child with Ent_SetRenderBounds, a local it captures from Entity.SetRenderBounds when its
+--          file loads (sent_prop2mesh/cl_init.lua, line 46 and setRenderBounds), from refresh() and from the mesh-done hook.
+--   SEEN:  in the test world, with Prop2Mesh loaded BEFORE InfMap's detours (so that it holds the engine's function), the box that
+--          InfMap gives back on entering the chunk is the plate's, and the mesh is culled (tools/fuzz_render.lua, P2MRAW=1).
+--   GUESS: that the game loads InfMap's detours before Prop2Mesh. Autorun files load before scripted entities (KNOWN), and InfMap's
+--          autorun file includes its detours at once, so Prop2Mesh should hold InfMap's function and this rule should never act.
+--          `acf_infmap_visdebug` reads the captured function out of Prop2Mesh and says which one it is.
+-- The rule below does not depend on the answer: in your own chunk, a mesh child must have the box Prop2Mesh computed from the mesh
+-- data (Prop2Mesh's own numbers: the data's bounds times the child's scale). If it has another one, it gets that one.
+local function MeshBox(Info, Child)
+	local Store = istable(prop2mesh) and prop2mesh.recycle
+	local Entry = istable(Store) and Info.crc and Store[Info.crc]
+	local Mesh  = istable(Entry) and istable(Entry.meshes) and Entry.meshes[Info.uniqueID]
+
+	if not (istable(Mesh) and Mesh.ready and isvector(Mesh.vmins) and isvector(Mesh.vmaxs)) then return end
+
+	local Scale = Child.scale
+
+	if isvector(Scale) and (Scale.x ~= 1 or Scale.y ~= 1 or Scale.z ~= 1) then
+		return Vector(Mesh.vmins.x * Scale.x, Mesh.vmins.y * Scale.y, Mesh.vmins.z * Scale.z), Vector(Mesh.vmaxs.x * Scale.x, Mesh.vmaxs.y * Scale.y, Mesh.vmaxs.z * Scale.z)
+	end
+
+	return Mesh.vmins, Mesh.vmaxs
+end
+
+local function RepairBoxes()
+	local LP   = LocalPlayer()
+	local Mine = IsValid(LP) and LP.CHUNK_OFFSET
+
+	if not Mine then return end
+
+	for _, Ent in ipairs(Render.P2M) do
+		if IsValid(Ent) and istable(Ent.prop2mesh_controllers) then
+			for _, Info in pairs(Ent.prop2mesh_controllers) do
+				local Child = Info.ent
+
+				-- Only where InfMap leaves the box alone: the child is in your chunk, not wrapped, and InfMap keeps no copy of its box
+				if IsValid(Child) and Child.CHUNK_OFFSET == Mine and Child.ValidRenderOverride == nil and Child.RENDER_BOUNDS == nil then
+					local Min, Max = MeshBox(Info, Child)
+
+					if Min then
+						local Has, Hasmax = Child:GetRenderBounds()
+
+						if Has:DistToSqr(Min) > 0.25 or Hasmax:DistToSqr(Max) > 0.25 then
+							Child:SetRenderBounds(Min, Max)
+
+							Stats.BoxRepaired = Stats.BoxRepaired + 1
+						end
+					end
 				end
 			end
 		end
@@ -651,6 +741,16 @@ local Steps = {
 }
 
 local function Frame()
+	-- The clipping-state probe of acf_infmap_visdebug runs even when the fix is switched off; its own error ends the probe, nothing else
+	if Render.Probe and Render.Probe.Until > SysTime() and Render.SampleClip then
+		local POK, PErr = pcall(Render.SampleClip)
+
+		if not POK then
+			Render.Probe.Until = 0
+			Render.Probe.Error = tostring(PErr)
+		end
+	end
+
 	if Render.Disabled or not On:GetBool() then return end
 
 	local LP = LocalPlayer()
@@ -745,6 +845,10 @@ if not Held("timer") then
 			InstallPass()         -- somebody may have replaced a gamemode function since
 			Scan()
 			Flush()
+
+			local BoxOK, BoxErr = pcall(RepairBoxes) -- its own protected call: a failure here must not stop the scan above
+
+			if not BoxOK then Fail("the Prop2Mesh render box check", BoxErr) end
 		end)
 
 		if not OK then Fail("the slow render scan", Err) end
@@ -985,10 +1089,320 @@ concommand.Add("acf_infmap_entdebug", function(_, _, Args)
 	for _, Line in ipairs(Render.EntityLines(Args and Args[1])) do print("[ACF-InfMap] " .. Line) end
 end)
 
+-- ---------------------------------------------------------------------------------------------------- acf_infmap_visdebug
+-- One command that prints everything needed to tell WHY a visual clip prop or a Prop2Mesh mesh is not shown in a chunk, in one paste:
+--   * which versions of InfMap, Visual Clip and Prop2Mesh the game really runs (size and line count of the files, compared with the
+--     sources this addon was written against; the assumption "the Workshop versions equal the sources I read" was a GUESS until now);
+--   * which function each addon captured when its file loaded (InfMap's detour or the engine's own), read out of the addons'
+--     closures with debug.getupvalue; this decides whether the position and render-box rules of this file apply at all;
+--   * whether InfMap holds wrappers on entities in YOUR chunk, or leaves entities of other chunks unwrapped;
+--   * the state of the nearest visual clip props and Prop2Mesh meshes (override, saved box, engine box, hidden, alpha, distance);
+--   * whether clipping is already switched on at the start of a frame, which some other addon would have to cause: every entity that
+--     switches clipping on itself (Visual Clip props, clipped meshes) then clips against planes meant for something else.
+-- Nothing here changes any entity. The probe runs for two seconds after the command, then the lines are printed.
+local Known = {
+	{Label = "InfMap cl_inf_chunks.lua",     Path = "infmap/cl_inf_chunks.lua",     Versions = {{"the original InfMap I read", 8982, 248}, {"the raphael fork I read", 9239, 254}}},
+	{Label = "InfMap cl_inf_detours.lua",    Path = "infmap/cl_inf_detours.lua",    Versions = {{"the original InfMap I read", 6142, 181}, {"the raphael fork I read", 6075, 177}}},
+	{Label = "InfMap sh_inf_networking.lua", Path = "infmap/sh_inf_networking.lua", Versions = {{"the original InfMap I read", 2295, 62}, {"the raphael fork I read", 2136, 57}}},
+	{Label = "InfMap sh_inf_functions.lua",  Path = "infmap/sh_inf_functions.lua",  Versions = {{"the original InfMap I read", 12329, 348}, {"the raphael fork I read", 12284, 346}}},
+	{Label = "Visual Clip clipping.lua",     Path = "autorun/client/clipping.lua",  Versions = {{"the Visual Clip I read", 3554, 148}}},
+	{Label = "Prop2Mesh cl_init.lua",        Path = "entities/sent_prop2mesh/cl_init.lua", Versions = {{"the Prop2Mesh I read", 20816, 871}}},
+}
+
+Render.Known = Known
+Render.Probe = Render.Probe or {Until = 0, Samples = 0, Enabled = 0}
+
+local Probe = Render.Probe
+
+--- Is clipping already enabled when the frame starts? (EnableClipping returns the state it replaced.) Called by Frame while armed.
+local function SampleClip()
+	local Was = render.EnableClipping(false)
+
+	render.EnableClipping(Was)
+
+	Probe.Samples = Probe.Samples + 1
+
+	if Was then Probe.Enabled = Probe.Enabled + 1 end
+end
+
+Render.SampleClip = SampleClip
+
+--- A Lua source file as the game has it; nil when it cannot be read
+local function ReadSource(Path)
+	local Text = file.Read(Path, "LUA")
+
+	if not isstring(Text) then Text = file.Read("lua/" .. Path, "GAME") end
+
+	return isstring(Text) and Text or nil
+end
+
+local function FingerprintLine(Entry)
+	local Text = ReadSource(Entry.Path)
+
+	if not Text then return Entry.Label .. ": not readable from Lua here" end
+
+	local Size, Lines = #Text, select(2, string.gsub(Text, "\n", ""))
+	local Match, All  = nil, {}
+
+	for _, V in ipairs(Entry.Versions) do
+		if V[2] == Size and V[3] == Lines then Match = V[1] end
+
+		All[#All + 1] = string.format("%s: %d bytes %d lines", V[1], V[2], V[3])
+	end
+
+	return string.format("%s: %d bytes, %d lines, crc %s -> %s", Entry.Label, Size, Lines, tostring(isfunction(util.CRC) and util.CRC(Text) or "?"),
+		Match and ("same size and line count as " .. Match) or ("DIFFERENT from every version I read (" .. table.concat(All, "; ") .. ")"))
+end
+
+--- The value of an upvalue of a Lua function, by name
+local function Upvalue(Fn, Name)
+	if not (isfunction(Fn) and istable(debug) and isfunction(debug.getupvalue)) then return nil end
+
+	for I = 1, 200 do
+		local N, V = debug.getupvalue(Fn, I)
+
+		if not N then return nil end
+		if N == Name then return V end
+	end
+end
+
+--- Which function is this: InfMap's detour (what the Entity table holds now), the engine's own function (InfMap keeps it as
+--- InfMap_<name>), or something else?
+local function WhichFunction(Value, Name)
+	if Value == nil then return "not found" end
+
+	local Raw = EntityMT["InfMap_" .. Name]
+
+	if Raw ~= nil and Value == Raw and Raw ~= EntityMT[Name] then return "the ENGINE's own function (InfMap's detour is not used by it)" end
+	if Value == EntityMT[Name] then return Raw ~= nil and "InfMap's detour" or "the function now in the Entity table (InfMap keeps no InfMap_" .. Name .. ")" end
+
+	return "some other function"
+end
+
+local function Try(Ent, Name, ...)
+	local Fn = Ent[Name]
+
+	if not isfunction(Fn) then return "?" end
+
+	local OK, A, B = pcall(Fn, Ent, ...)
+
+	if not OK then return "?" end
+
+	return A, B
+end
+
+local function BoxText(Min, Max)
+	if not (isvector(Min) and isvector(Max)) then return "none" end
+
+	return string.format("[%.0f %.0f %.0f]..[%.0f %.0f %.0f]", Min.x, Min.y, Min.z, Max.x, Max.y, Max.z)
+end
+
+--- The lines for one entity
+local function Describe(Ent, Mine, Indent)
+	local Lines  = {}
+	local Parent = Try(Ent, "GetParent")
+	local Min, Max = Try(Ent, "GetRenderBounds")
+	local Same   = Mine and Ent.CHUNK_OFFSET == Mine
+	local Colour = Try(Ent, "GetColor")
+	local Wrapped = Ent.ValidRenderOverride ~= nil
+
+	Lines[#Lines + 1] = string.format("%s%s #%d [%s]: model %s, hidden %s, alpha %s, dormant %s, parent %s", Indent, Ent:GetClass(), Ent:EntIndex(), Chunks(Ent, Mine),
+		tostring((Try(Ent, "GetModel"))), tostring((Try(Ent, "GetNoDraw"))), tostring(istable(Colour) and Colour.a or (Colour and Colour.a) or "?"), tostring((Try(Ent, "IsDormant"))),
+		(isentity(Parent) and IsValid(Parent)) and (Parent:GetClass() .. " #" .. Parent:EntIndex()) or "none")
+
+	Lines[#Lines + 1] = string.format("%s    override now: %s. Wrapped by InfMap: %s (the entity's own override under it: %s). InfMap's saved box: %s. Engine box: %s.", Indent,
+		Kind(Ent, Ent.RenderOverride), Wrapped and "YES" or "no", Wrapped and Kind(Ent, Ent.OldRenderOverride) or "-", Ent.RENDER_BOUNDS and BoxText(Ent.RENDER_BOUNDS[1], Ent.RENDER_BOUNDS[2]) or "none", BoxText(Min, Max))
+
+	if Same and Wrapped then Lines[#Lines + 1] = Indent .. "    !! InfMap still holds a wrapper on this entity although it is in YOUR chunk: it is drawn one chunk away." end
+
+	if Same and isvector(Min) and isvector(Max) and isfunction(Ent.LocalToWorld) then
+		local Centre = Ent:LocalToWorld((Min + Max) * 0.5)
+		local Off    = Centre - EyePos()
+		local Bound  = InfMap.source_bounds and InfMap.source_bounds.x or 16384
+
+		Lines[#Lines + 1] = string.format("%s    engine box centre is %.0f units from your eye, %s the +-%d world box (culled by the engine when it is outside).", Indent, Off:Length(),
+			(math.abs(Centre.x) <= Bound and math.abs(Centre.y) <= Bound and math.abs(Centre.z) <= Bound) and "inside" or "OUTSIDE", Bound)
+	end
+
+	if Ent.MaxClips ~= nil and isfunction(Ent.OBBCenter) and isfunction(Ent.LocalToWorld) then
+		local Centre = Ent:OBBCenter()
+		local A      = Ent:LocalToWorld(Centre)
+		local B      = isfunction(Ent.InfMap_LocalToWorld) and Ent:InfMap_LocalToWorld(Centre) or A
+
+		Lines[#Lines + 1] = string.format("%s    visual clip: %s plane(s) in use. LocalToWorld of its centre is %.2f chunk(s) from the engine's own answer (0 expected in YOUR chunk).", Indent, tostring(Ent.MaxClips), (A - B):Length() / (InfMap.chunk_size * 2))
+	end
+
+	return Lines
+end
+
+--- Distance from your eye, in the frame InfMap's GetPos answers in (your chunk's). Entities that cannot say come last.
+local function EyeDistance(Ent)
+	local OK, Pos = pcall(Ent.GetPos, Ent)
+
+	return (OK and isvector(Pos)) and Pos:DistToSqr(EyePos()) or math.huge
+end
+
+--- Nearest first: by chunk, and inside a chunk by distance from your eye (a chunk can hold hundreds of clipped props; the dump
+--- lists only a few, and they have to be the ones next to you)
+local function ByDistance(Mine)
+	return function(A, B)
+		local DA = (Mine and A.CHUNK_OFFSET) and (A.CHUNK_OFFSET - Mine):LengthSqr() or math.huge
+		local DB = (Mine and B.CHUNK_OFFSET) and (B.CHUNK_OFFSET - Mine):LengthSqr() or math.huge
+
+		if DA ~= DB then return DA < DB end
+
+		local EA, EB = EyeDistance(A), EyeDistance(B)
+
+		if EA ~= EB then return EA < EB end
+
+		return A:EntIndex() < B:EntIndex()
+	end
+end
+
+--- Lines for `acf_infmap_visdebug`. Exposed for the harness.
+function Render.VisLines()
+	local Lines = {}
+	local LP    = LocalPlayer()
+	local Mine  = IsValid(LP) and LP.CHUNK_OFFSET or nil
+	local All   = ents.GetAll()
+
+	Lines[#Lines + 1] = string.format("visual contraption dump. You are in chunk %s. Render fix %s.", Mine and Compat.ChunkText(LP) or "?", (On:GetBool() and not Render.Disabled) and "ON" or "OFF")
+	Lines[#Lines + 1] = "-- 1. the files the game really runs (compared with the sources this addon was written against)"
+
+	for _, Entry in ipairs(Known) do Lines[#Lines + 1] = "   " .. FingerprintLine(Entry) end
+
+	-- InfMap.prop_update_chunk: ours wraps it; the wrapper holds the original in the upvalue Original
+	local Current = InfMap and InfMap.prop_update_chunk
+	local Own     = Upvalue(Current, "Original") or Current
+	local Info    = (istable(debug) and isfunction(debug.getinfo) and isfunction(Own)) and debug.getinfo(Own, "S") or nil
+
+	Lines[#Lines + 1] = string.format("   InfMap.prop_update_chunk: %s; defined at %s lines %s-%s (original InfMap: 127-248, raphael fork: 134-254)", Upvalue(Current, "Original") and "wrapped by this addon" or "NOT wrapped by this addon",
+		Info and tostring(Info.short_src) or "?", Info and tostring(Info.linedefined) or "?", Info and tostring(Info.lastlinedefined) or "?")
+
+	Lines[#Lines + 1] = "-- 2. which function each addon captured when its file loaded"
+
+	local Refresh = istable(prop2mesh) and prop2mesh.refresh
+	local SetBox  = Upvalue(Upvalue(Refresh, "setRenderBounds"), "Ent_SetRenderBounds")
+
+	Lines[#Lines + 1] = "   Prop2Mesh SetRenderBounds: " .. (Refresh and WhichFunction(SetBox, "SetRenderBounds") or "Prop2Mesh not loaded")
+	Lines[#Lines + 1] = "   Prop2Mesh GetPos: " .. (Refresh and WhichFunction(Upvalue(Refresh, "Ent_GetPos"), "GetPos") or "Prop2Mesh not loaded")
+	Lines[#Lines + 1] = "   Prop2Mesh SetPos: " .. (Refresh and WhichFunction(Upvalue(Refresh, "Ent_SetPos"), "SetPos") or "Prop2Mesh not loaded")
+
+	local Clipped = {}
+	local Sample
+
+	for _, Ent in ipairs(All) do
+		if IsValid(Ent) and Ent:EntIndex() > 0 and Ent.MaxClips ~= nil then
+			Clipped[#Clipped + 1] = Ent
+
+			if not Sample then
+				local Fn = Ent.ValidRenderOverride ~= nil and Ent.OldRenderOverride or Ent.RenderOverride
+
+				Sample = Unwrap[Fn] or Fn
+			end
+		end
+	end
+
+	Lines[#Lines + 1] = "   Visual Clip LocalToWorld: " .. (Sample and WhichFunction(Upvalue(Sample, "ent_LocalToWorld"), "LocalToWorld") or "no clipped prop to read it from")
+
+	Lines[#Lines + 1] = "-- 3. InfMap's contract"
+
+	local Stuck, Unwrapped = {}, {}
+
+	if Mine then
+		for _, Ent in ipairs(All) do
+			if IsValid(Ent) and Ent.CHUNK_OFFSET and Ent:EntIndex() > 0 then
+				if Ent.CHUNK_OFFSET == Mine then
+					if Ent.ValidRenderOverride ~= nil then Stuck[#Stuck + 1] = Ent end
+				elseif (Ent.CHUNK_OFFSET - Mine):LengthSqr() <= 100 and Ent.ValidRenderOverride == nil and not Ent:IsPlayer() and not InfMap.filter_entities(Ent) then
+					Unwrapped[#Unwrapped + 1] = Ent
+				end
+			end
+		end
+	end
+
+	table.sort(Stuck, ByDistance(Mine))
+	table.sort(Unwrapped, ByDistance(Mine))
+
+	Lines[#Lines + 1] = string.format("   entities InfMap holds wrapped although they are in your chunk: %d (this addon has put %d right so far%s)", #Stuck, Stats.RenderStuck, Render.LastStuck and (", the last was " .. Render.LastStuck) or "")
+
+	for I = 1, math.min(#Stuck, 5) do
+		for _, Line in ipairs(Describe(Stuck[I], Mine, "   ")) do Lines[#Lines + 1] = Line end
+	end
+
+	Lines[#Lines + 1] = string.format("   entities within 10 chunks that are NOT wrapped although they are in another chunk: %d", #Unwrapped)
+
+	for I = 1, math.min(#Unwrapped, 3) do Lines[#Lines + 1] = string.format("      %s #%d [%s]", Unwrapped[I]:GetClass(), Unwrapped[I]:EntIndex(), Chunks(Unwrapped[I], Mine)) end
+
+	Lines[#Lines + 1] = string.format("   Prop2Mesh render boxes put right so far: %d", Stats.BoxRepaired)
+	Lines[#Lines + 1] = "-- 4. clipping state at the start of a frame"
+	Lines[#Lines + 1] = Probe.Error and ("   the probe raised an error: " .. Probe.Error) or string.format("   sampled %d frame(s): clipping was already enabled at the start of %d of them%s", Probe.Samples, Probe.Enabled,
+		Probe.Enabled > 0 and " -> somebody leaves clipping on; every entity that switches it on itself will clip against whatever plane is still pushed" or "")
+
+	Lines[#Lines + 1] = "-- 5. nearest visual clip props"
+
+	table.sort(Clipped, ByDistance(Mine))
+
+	if #Clipped == 0 then Lines[#Lines + 1] = "   none (no prop holds a visual clip on this client)" end
+
+	for I = 1, math.min(#Clipped, 5) do
+		for _, Line in ipairs(Describe(Clipped[I], Mine, "   ")) do Lines[#Lines + 1] = Line end
+	end
+
+	Lines[#Lines + 1] = "-- 6. nearest Prop2Mesh entities and their meshes"
+
+	local Meshes = {}
+
+	for _, Ent in ipairs(Render.P2M) do
+		if IsValid(Ent) then Meshes[#Meshes + 1] = Ent end
+	end
+
+	table.sort(Meshes, ByDistance(Mine))
+
+	if #Meshes == 0 then Lines[#Lines + 1] = "   none" end
+
+	for I = 1, math.min(#Meshes, 3) do
+		local Ent = Meshes[I]
+
+		for _, Line in ipairs(Describe(Ent, Mine, "   ")) do Lines[#Lines + 1] = Line end
+
+		local Shown = 0
+
+		for K, Inf in pairs(istable(Ent.prop2mesh_controllers) and Ent.prop2mesh_controllers or {}) do
+			local Child = Inf.ent
+
+			if IsValid(Child) and Shown < 3 then
+				Shown = Shown + 1
+
+				for _, Line in ipairs(Describe(Child, Mine, "      mesh " .. tostring(K) .. ": ")) do Lines[#Lines + 1] = Line end
+
+				local Min, Max = MeshBox(Inf, Child)
+				local Local    = Try(Child, "GetLocalPos")
+				local Link     = Inf.linkpos or vector_origin
+
+				Lines[#Lines + 1] = string.format("         mesh data box: %s; local offset from linkpos: %s", Min and BoxText(Min, Max) or "no mesh data yet",
+					isvector(Local) and string.format("%.1f units", Local:Distance(Link)) or "?")
+			end
+		end
+	end
+
+	return Lines
+end
+
+concommand.Add("acf_infmap_visdebug", function()
+	Probe.Until, Probe.Samples, Probe.Enabled, Probe.Error = SysTime() + 2, 0, 0, nil
+
+	print("[ACF-InfMap] collecting for 2 seconds; keep the vehicle's parts in view (the clipping-state sample needs frames)")
+
+	timer.Simple(2.2, function()
+		for _, Line in ipairs(Render.VisLines()) do print("[ACF-InfMap] " .. Line) end
+	end)
+end)
+
 Compat.StatusLines.cl_render = function()
 	return {
-		string.format("render: guard %s, %d entities watched, overrides put back %d, meshes repositioned %d, children adopted %d, drawn through Draw %d, render boxes converted %d (%s), errors %d (acf_infmap_renderdebug and acf_infmap_entdebug list them)",
-			(On:GetBool() and not Render.Disabled) and "ON" or "OFF", #List, Stats.RenderRescued, Stats.MeshRepositioned, Stats.ChildrenAdopted, Stats.DrawRouted, Stats.BoundsConverted, Render.BoundsReady and "ready" or "NOT ACTIVE: InfMap's RenderScene hook not found", Stats.RenderErrors),
+		string.format("render: guard %s, %d entities watched, overrides put back %d, meshes repositioned %d, children adopted %d, drawn through Draw %d, render boxes converted %d (%s), wrappers left in your own chunk put right %d, Prop2Mesh boxes put right %d, errors %d (acf_infmap_renderdebug, acf_infmap_entdebug and acf_infmap_visdebug list them)",
+			(On:GetBool() and not Render.Disabled) and "ON" or "OFF", #List, Stats.RenderRescued, Stats.MeshRepositioned, Stats.ChildrenAdopted, Stats.DrawRouted, Stats.BoundsConverted, Render.BoundsReady and "ready" or "NOT ACTIVE: InfMap's RenderScene hook not found", Stats.RenderStuck, Stats.BoxRepaired, Stats.RenderErrors),
 		string.format("visclip: resync %s, %d request(s) sent, server side %s", Resync:GetBool() and "ON" or "OFF", Stats.ClipRequests, CanAsk() and "present" or "ABSENT"),
 		(#Render.HeldList() > 0) and ("render parts HELD BACK (diagnostic): " .. table.concat(Render.HeldList(), ", ")) or "render parts held back: none",
 	}
