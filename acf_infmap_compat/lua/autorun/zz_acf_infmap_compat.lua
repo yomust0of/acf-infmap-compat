@@ -62,7 +62,7 @@ else
 	include("acf_infmap_compat/cl_effects.lua")
 	include("acf_infmap_compat/cl_replay.lua")
 	include("acf_infmap_compat/cl_bullets.lua")
-	--include("acf_infmap_compat/cl_render.lua")
+	include("acf_infmap_compat/cl_render.lua")
 	include("acf_infmap_compat/cl_origin.lua")
 	include("acf_infmap_compat/cl_menu.lua")
 end

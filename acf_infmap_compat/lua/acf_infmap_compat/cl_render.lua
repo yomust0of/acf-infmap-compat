@@ -81,7 +81,7 @@
 -- part (stock Prop2Mesh behaviour, also in a normal map). If Prop2Mesh's LinkEntRemoved moved a mesh to its parent's origin, this
 -- file puts it back at linkpos, which is what the next refresh would do anyway.
 
-local Compat = InfmapCompat or ACFInfMapCompat
+local Compat = ACFInfMapCompat
 local Stats  = Compat.Stats
 
 local On     = CreateClientConVar("acf_infmap_cl_render_fix", "1", true, false, "1 = keep visual clips and Prop2Mesh meshes right in other chunks. 0 = stock behaviour.", 0, 1)
@@ -90,9 +90,68 @@ local Range  = CreateClientConVar("acf_infmap_cl_visclip_range", "12", true, fal
 local Bounds = CreateClientConVar("acf_infmap_cl_render_bounds", "1", true, false, "1 = a render box that a script sets in world coordinates (SetRenderBoundsWS) is converted into the entity's own chunk frame before it is stored. 0 = stock.", 0, 1)
 local Scripted = CreateClientConVar("acf_infmap_cl_render_draw", "1", true, false, "1 = in other chunks, run a scripted entity's own Draw / DrawTranslucent (beams, glows, overlays) as well as its model. 0 = stock InfMap (model only).", 0, 1)
 
+local Hold = CreateClientConVar("acf_infmap_cl_render_hold", "", true, false, "Diagnostics. Parts of this file NOT to install, read when they are installed (use retry after changing it): passhooks scenehook boundswrap chunkwrap frame created timer, or all. Empty = install everything.")
+
+local PassMode = CreateClientConVar("acf_infmap_cl_render_passmode", "gamemode", true, false, "Diagnostics. How this file learns which draw pass the engine is in. gamemode = wrap the gamemode's PreDraw/PostDraw functions (adds no hook). hooks = add three hooks (version 7.4 and earlier; on gm_infmap_kirovskoe they made the terrain invisible). Read when installed: retry after changing it.")
+
 local Render = Compat.Render or {}
 
 Compat.Render = Render
+
+-- ---------------------------------------------------------------------------------------------------- hold-back switch
+-- WHY THIS EXISTS: on one map (gm_infmap_kirovskoe, whose own Lua builds its terrain and buildings) the terrain and buildings near
+-- you disappear while this file is loaded, and are fine when it is not. The switches above (`acf_infmap_cl_render_fix`, `_draw`,
+-- `_bounds`) only turn the WORK off; the hooks and wrappers stay installed, and "which of those installed parts does it" cannot be
+-- told from reading. This setting leaves a part out of the game altogether, so a bisect is possible without editing the file:
+--
+--     acf_infmap_cl_render_hold "passhooks scenehook"     (names separated by spaces or commas, any case)
+--     retry
+--
+--   passhooks   the draw-pass detection (see "Which pass the engine is in" below; the part that made the terrain invisible on Kirovskoe
+--               when it was three hooks)
+--   scenehook   the wrapper around InfMap's RenderScene hook (and with it the render box correction, which needs the wrapper)
+--   boundswrap  the replacement of Entity:SetRenderBoundsWS (the wrapper of InfMap's hook stays)
+--   chunkwrap   the replacement of InfMap.prop_update_chunk
+--   frame       the PreRender hook (override guard, Prop2Mesh sweep, render list top-up)
+--   created     the OnEntityCreated hook
+--   timer       the half-second scan (also re-installs the render box correction when InfMap's hook shows up late)
+--   all         every part above
+--
+-- It is read when a part is installed, which is at load; a part that is already installed stays until the next retry. Nothing here
+-- changes what the parts do. Held parts are listed in the load message, `acf_infmap_status` and `acf_infmap_renderdebug`.
+Render.Pieces = {"passhooks", "scenehook", "boundswrap", "chunkwrap", "frame", "created", "timer"}
+
+--- The names in the setting, lower case. Anything that is not a name of a part is kept here and simply holds nothing back.
+local function HeldNames()
+	local Names = {}
+	local Text  = string.lower(Hold:GetString() or "")
+
+	for Word in string.gmatch(Text, "[^%s,;]+") do Names[Word] = true end
+
+	return Names
+end
+
+--- Is this part held back (left uninstalled)?
+local function Held(Piece)
+	local Names = HeldNames()
+
+	return Names.all == true or Names[Piece] == true
+end
+
+--- The held parts, in the order of Render.Pieces. Exposed for the harness and the diagnostics.
+function Render.HeldList()
+	local Out = {}
+
+	for _, Piece in ipairs(Render.Pieces) do
+		if Held(Piece) then Out[#Out + 1] = Piece end
+	end
+
+	return Out
+end
+
+if #Render.HeldList() > 0 then
+	Compat.Warn("cl_render: holding back ", table.concat(Render.HeldList(), ", "), " (acf_infmap_cl_render_hold = '", Hold:GetString(), "'). This is a diagnostic setting; set it to '' and retry for the normal behaviour.")
+end
 
 Render.Errors  = Render.Errors or 0
 Render.Unwrap  = Render.Unwrap or setmetatable({}, {__mode = "k"}) -- [our wrapper function] = the override it wraps
@@ -112,20 +171,6 @@ local MaxPending    = 8192
 -- Counters this file adds to the shared list (sh_core.lua declares them too; this keeps the file usable on its own)
 for _, Name in ipairs({"RenderRescued", "RenderThrottled", "RenderErrors", "RenderContextErrors", "ChildrenAdopted", "MeshRepositioned", "DrawRouted", "ClipRequests", "BoundsConverted"}) do
 	Stats[Name] = Stats[Name] or 0
-end
-
-local function ForceRenderVisibility(Ent)
-	if not IsValid(Ent) then return end
-	
-	-- Clear out any forced fade distances that hide complex architecture up close
-	if isfunction(Ent.SetNoDraw) and Ent:GetNoDraw() then
-		Ent:SetNoDraw(false)
-	end
-
-	-- Force RENDERGROUP_BOTH so complex map assets aren't culled by local PVS checks
-	if isfunction(Ent.SetRenderGroup) then
-		Ent:SetRenderGroup(RENDERGROUP_BOTH)
-	end
 end
 
 local function Fail(Where, Err)
@@ -152,18 +197,15 @@ local function Contextualize(Fn)
 
 	Run = function(Ent, ...)
 		local Me   = LocalPlayer()
-		local Mine = IsValid(Me) and Me.CHUNK_OFFSET
-		local MineEnt = Ent.CHUNK_OFFSET
-
-		-- FIX: If we are in the same local chunk, skip forcing wrapper offsets entirely
-		if not (IsValid(Me) and MineEnt) or (Mine and MineEnt == Mine) then 
-			return Fn(Ent, ...) 
-		end
+		local Mine = Ent.CHUNK_OFFSET
 
 		Ent.ACFInfMapDraws = (Ent.ACFInfMapDraws or 0) + 1
 
+		if not (IsValid(Me) and Mine) then return Fn(Ent, ...) end
+
 		local Saved = Me.CHUNK_OFFSET
-		Me.CHUNK_OFFSET = MineEnt
+
+		Me.CHUNK_OFFSET = Mine
 
 		local OK, Err = pcall(Fn, Ent, ...)
 
@@ -183,15 +225,83 @@ local function Contextualize(Fn)
 end
 
 -- Which pass the engine is in. Two independent signals, and either one is enough:
---   * the hooks below (KNOWN: the engine runs the opaque renderables, then PreDrawTranslucentRenderables, the translucent ones,
---     PostDrawTranslucentRenderables);
+--   * the engine runs the opaque renderables, then PreDrawTranslucentRenderables, the translucent ones, PostDrawTranslucentRenderables
+--     (KNOWN). This file learns of those three moments from the GAMEMODE's own functions of those names, not from hooks (see below);
 --   * the flags the engine hands to RenderOverride: STUDIO_DRAWTRANSLUCENTSUBMODELS (4; the GMod wiki words it "current render is
 --     for translucent renderables only"). GUESS: whether the engine sets it for every translucent-pass draw or only for two-pass
---     models, which is why a flags value that says "opaque" never overrules the hooks. STUDIO_TRANSPARENCY (0x80000000) is NOT read:
---     in the Source SDK's studio.h it marks a non-sorting brush model, not a pass.
-hook.Add("PreDrawOpaqueRenderables", "ACFInfMapCompat_Pass", function() Render.Translucent = false end)
-hook.Add("PreDrawTranslucentRenderables", "ACFInfMapCompat_Pass", function() Render.Translucent = true end)
-hook.Add("PostDrawTranslucentRenderables", "ACFInfMapCompat_Pass", function() Render.Translucent = false end)
+--     models, which is why a flags value that says "opaque" never overrules the pass tracking. STUDIO_TRANSPARENCY (0x80000000) is NOT
+--     read: in the Source SDK's studio.h it marks a non-sorting brush model, not a pass.
+--
+-- WHY NOT HOOKS (SEEN in play-test 7.4): with three hook.Add calls here (PreDrawOpaqueRenderables, PreDrawTranslucentRenderables,
+-- PostDrawTranslucentRenderables, name "ACFInfMapCompat_Pass", bodies that return nothing), the terrain and buildings of
+-- gm_infmap_kirovskoe vanished near the player; `acf_infmap_cl_render_hold passhooks` (these three and nothing else left out) made the
+-- map right again, and every other part of this file was installed in both runs. A hook that returns nothing cannot change what other
+-- hooks draw, so the effect has to come from the table the hooks live in:
+--   KNOWN: hook.Call walks the event's table with pairs(), i.e. in table order, which Lua does not define, and a new key can move the
+--          others (a table that gets one key too many is rebuilt).
+--   GUESS: that the map (or something it loads) draws in more than one hook on one of these events and works only in the order it
+--          happened to get, so that three more keys put it in the other order. `acf_infmap_hooklist` prints the order; set
+--          `acf_infmap_cl_render_passmode hooks` (and retry) to bring the old behaviour back and compare the two prints.
+-- The gamemode's function of the same name is called by hook.Call after all hooks, if no hook returned a value, and it is a field of
+-- the gamemode table, not a key of any hook table, so wrapping it adds nothing to the tables whose order the map may depend on.
+-- If a hook returns a value the gamemode function is not called, but then the engine skips that pass too, so there is nothing to
+-- classify. KNOWN: hook.Call in GMod's lua/includes/modules/hook.lua; not re-read in this session.
+local PassEvents   = {{"PreDrawOpaqueRenderables", false}, {"PreDrawTranslucentRenderables", true}, {"PostDrawTranslucentRenderables", false}}
+local PassWrappers = Render.PassWrappers or setmetatable({}, {__mode = "k"}) -- [our wrapper function] = true
+
+Render.PassWrappers = PassWrappers
+
+--- Starts (or checks again, it is idempotent) the tracking of the draw pass. Needs the gamemode, so it can be too early at load.
+local function InstallPass()
+	local Label = "draw pass detection"
+
+	if Held("passhooks") then
+		Compat.Status[Label] = "held back (acf_infmap_cl_render_hold)"
+
+		return
+	end
+
+	if string.lower(PassMode:GetString()) == "hooks" then
+		for _, Event in ipairs(PassEvents) do
+			local Value = Event[2]
+
+			hook.Add(Event[1], "ACFInfMapCompat_Pass", function() Render.Translucent = Value end)
+		end
+
+		Compat.Status[Label] = "hooks (diagnostic mode, acf_infmap_cl_render_passmode)"
+
+		return
+	end
+
+	local Gm = GAMEMODE
+
+	if not istable(Gm) then
+		Compat.Status[Label] = "waiting for the gamemode"
+
+		return
+	end
+
+	for _, Event in ipairs(PassEvents) do
+		local Name, Value = Event[1], Event[2]
+		local Current     = Gm[Name]
+
+		-- Wrapped again only when somebody put another function there since
+		if not (isfunction(Current) and PassWrappers[Current]) then
+			local Wrapper = function(Self, ...)
+				Render.Translucent = Value
+
+				if isfunction(Current) then return Current(Self, ...) end
+			end
+
+			PassWrappers[Wrapper] = true
+			Gm[Name] = Wrapper
+		end
+	end
+
+	Compat.Status[Label] = "wrapped (gamemode functions, no hook added)"
+end
+
+Render.InstallPass = InstallPass
 
 local function FlagBit(Flags, Index)
 	-- Lua numbers are doubles here: a flag word can arrive signed or unsigned, so it is brought into 0..2^32-1 first
@@ -236,15 +346,6 @@ end
 
 --- Called before InfMap's function: moves a replaced override back where InfMap looks for it, and gives a scripted entity its Draw route.
 local function Before(Ent)
-	local Me = LocalPlayer()
-	local Mine = IsValid(Me) and Me.CHUNK_OFFSET
-	local EntChunk = Ent.CHUNK_OFFSET
-
-	-- Skip forcing compatibility overrides if entity is in our local chunk
-	if Mine and EntChunk and EntChunk == Mine then
-		return
-	end
-
 	if Ent.ValidRenderOverride ~= nil then
 		local Installed = Ent.ACFInfMapInstalled
 		local Current   = Ent.RenderOverride
@@ -563,7 +664,7 @@ local function Frame()
 	end
 end
 
-hook.Add("PreRender", "ACFInfMapCompat_Render", Frame)
+if not Held("frame") then hook.Add("PreRender", "ACFInfMapCompat_Render", Frame) end
 
 -- ---------------------------------------------------------------------------------------------------- slower work
 local function CanAsk()
@@ -590,9 +691,6 @@ local function Scan()
 		local Chunk = Ent.CHUNK_OFFSET
 
 		if Chunk then
-			-- Force visibility flags so high-detail building architecture doesn't vanish up close
-			ForceRenderVisibility(Ent)
-
 			-- Wrapped by InfMap before this file was loaded (so the guard does not know it): take it over, once
 			if Ent.ValidRenderOverride ~= nil and not Ent.ACFInfMapListed then InfMap.prop_update_chunk(Ent, Chunk) end
 
@@ -630,32 +728,51 @@ end
 -- A Prop2Mesh entity is known the moment it is created, so its first mesh is repaired before it is ever drawn. The half-second
 -- scan below is the catch-all (it also drops entities that are gone).
 --   GUESS: that GetClass() already answers inside OnEntityCreated on the client. If it does not, a new entity waits for the scan.
-hook.Add("OnEntityCreated", "ACFInfMapCompat_Render", function(Ent)
-	if IsValid(Ent) and Ent:GetClass() == "sent_prop2mesh" then Render.P2M[#Render.P2M + 1] = Ent end
-end)
-
-timer.Create("ACFInfMapCompat_RenderSlow", 0.5, 0, function()
-	if Render.Disabled or not On:GetBool() then return end
-
-	local OK, Err = pcall(function()
-		Render.P2M = ents.FindByClass("sent_prop2mesh")
-
-		Render.InstallBounds() -- InfMap may have registered its hook after us, or again (a Lua refresh)
-		Scan()
-		Flush()
+if not Held("created") then
+	hook.Add("OnEntityCreated", "ACFInfMapCompat_Render", function(Ent)
+		if IsValid(Ent) and Ent:GetClass() == "sent_prop2mesh" then Render.P2M[#Render.P2M + 1] = Ent end
 	end)
+end
 
-	if not OK then Fail("the slow render scan", Err) end
-end)
+if not Held("timer") then
+	timer.Create("ACFInfMapCompat_RenderSlow", 0.5, 0, function()
+		if Render.Disabled or not On:GetBool() then return end
+
+		local OK, Err = pcall(function()
+			Render.P2M = ents.FindByClass("sent_prop2mesh")
+
+			Render.InstallBounds() -- InfMap may have registered its hook after us, or again (a Lua refresh)
+			InstallPass()         -- somebody may have replaced a gamemode function since
+			Scan()
+			Flush()
+		end)
+
+		if not OK then Fail("the slow render scan", Err) end
+	end)
+end
 
 -- ---------------------------------------------------------------------------------------------------- install
 --- The render box correction: InfMap's hook first (the detour only acts once the hook is wrapped), then the detour. Idempotent, so the
 --- half-second scan calls it too: when InfMap's hook shows up after this file ran, the correction starts then.
 function Render.InstallBounds()
+	local Label = "render bounds (Entity:SetRenderBoundsWS)"
+
+	-- Without the wrapper of InfMap's hook the correction cannot tell InfMap's own calls from the others, so it never acts
+	if Held("scenehook") then
+		Render.BoundsReady = false
+		Compat.Status[Label] = "held back (acf_infmap_cl_render_hold)"
+
+		return
+	end
+
 	if WrapBoundsHook() then
-		Compat.Wrap(EntityMT, "SetRenderBoundsWS", MakeBoundsDetour, "render bounds (Entity:SetRenderBoundsWS)")
+		if Held("boundswrap") then
+			Compat.Status[Label] = "held back (acf_infmap_cl_render_hold)"
+		else
+			Compat.Wrap(EntityMT, "SetRenderBoundsWS", MakeBoundsDetour, Label)
+		end
 	else
-		Compat.Status["render bounds (Entity:SetRenderBoundsWS)"] = "InfMap's RenderScene hook not found: left alone"
+		Compat.Status[Label] = "InfMap's RenderScene hook not found: left alone"
 	end
 end
 
@@ -666,9 +783,14 @@ local function Install()
 		return
 	end
 
-	Compat.Wrap(InfMap, "prop_update_chunk", WrapChunkUpdate, "render guard (InfMap.prop_update_chunk)")
+	if Held("chunkwrap") then
+		Compat.Status["render guard (InfMap.prop_update_chunk)"] = "held back (acf_infmap_cl_render_hold)"
+	else
+		Compat.Wrap(InfMap, "prop_update_chunk", WrapChunkUpdate, "render guard (InfMap.prop_update_chunk)")
+	end
 
 	Render.InstallBounds()
+	InstallPass()
 end
 
 Render.Install = Install
@@ -710,6 +832,9 @@ function Render.DebugLines()
 
 	Lines[#Lines + 1] = string.format("fix %s, visclip resync %s (range %g chunks, server side %s), disabled by errors: %s",
 		On:GetBool() and "ON" or "OFF", Resync:GetBool() and "ON" or "OFF", Range:GetFloat(), CanAsk() and "present" or "ABSENT", Render.Disabled and "YES" or "no")
+	local Held_ = Render.HeldList()
+
+	Lines[#Lines + 1] = #Held_ > 0 and ("HELD BACK by acf_infmap_cl_render_hold (not installed): " .. table.concat(Held_, ", ")) or "nothing held back (acf_infmap_cl_render_hold is empty)"
 	Lines[#Lines + 1] = string.format("you are in chunk %s", Mine and Compat.ChunkText(LP) or "?")
 	Lines[#Lines + 1] = string.format("entities InfMap wrapped and this file watches: %d", #List)
 
@@ -760,6 +885,42 @@ end
 
 concommand.Add("acf_infmap_renderdebug", function()
 	for _, Line in ipairs(Render.DebugLines()) do print("[ACF-InfMap] " .. Line) end
+end)
+
+--- Lines for `acf_infmap_hooklist`: the hook names of the events this addon and the map's rendering care about, in the order GMod runs
+--- them (the order of pairs over the table, which is what hook.Call uses; the table is not changed between the two walks). Exposed for the harness.
+local ListedEvents = {"PreDrawOpaqueRenderables", "PostDrawOpaqueRenderables", "PreDrawTranslucentRenderables", "PostDrawTranslucentRenderables", "RenderScene", "PreRender"}
+
+function Render.HookLines()
+	local Lines = {}
+	local Set   = hook.GetTable() or {}
+
+	Lines[1] = "hook names per event, in the order GMod runs them. Names starting with ACFInfMapCompat_ are this addon's."
+
+	for _, Event in ipairs(ListedEvents) do
+		local Names = {}
+
+		for Name in pairs(Set[Event] or {}) do Names[#Names + 1] = tostring(Name) end
+
+		Lines[#Lines + 1] = string.format("%s (%d): %s", Event, #Names, #Names > 0 and table.concat(Names, ", ") or "-")
+	end
+
+	local Wrapped = {}
+
+	if istable(GAMEMODE) then
+		for _, Event in ipairs(PassEvents) do
+			if PassWrappers[GAMEMODE[Event[1]]] then Wrapped[#Wrapped + 1] = Event[1] end
+		end
+	end
+
+	Lines[#Lines + 1] = "gamemode functions this addon wraps to see the draw pass: " .. (#Wrapped > 0 and table.concat(Wrapped, ", ") or "none")
+	Lines[#Lines + 1] = "draw pass detection: " .. tostring(Compat.Status["draw pass detection"]) .. "; acf_infmap_cl_render_passmode = " .. PassMode:GetString()
+
+	return Lines
+end
+
+concommand.Add("acf_infmap_hooklist", function()
+	for _, Line in ipairs(Render.HookLines()) do print("[ACF-InfMap] " .. Line) end
 end)
 
 --- Lines for `acf_infmap_entdebug <part of a class name>`: what this addon and InfMap are doing to the entities of that class (at most
@@ -829,5 +990,6 @@ Compat.StatusLines.cl_render = function()
 		string.format("render: guard %s, %d entities watched, overrides put back %d, meshes repositioned %d, children adopted %d, drawn through Draw %d, render boxes converted %d (%s), errors %d (acf_infmap_renderdebug and acf_infmap_entdebug list them)",
 			(On:GetBool() and not Render.Disabled) and "ON" or "OFF", #List, Stats.RenderRescued, Stats.MeshRepositioned, Stats.ChildrenAdopted, Stats.DrawRouted, Stats.BoundsConverted, Render.BoundsReady and "ready" or "NOT ACTIVE: InfMap's RenderScene hook not found", Stats.RenderErrors),
 		string.format("visclip: resync %s, %d request(s) sent, server side %s", Resync:GetBool() and "ON" or "OFF", Stats.ClipRequests, CanAsk() and "present" or "ABSENT"),
+		(#Render.HeldList() > 0) and ("render parts HELD BACK (diagnostic): " .. table.concat(Render.HeldList(), ", ")) or "render parts held back: none",
 	}
 end

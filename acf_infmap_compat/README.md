@@ -1,4 +1,4 @@
-# ACF3 <-> InfMap compatibility (standalone addon), version 7.3
+# ACF3 <-> InfMap compatibility (standalone addon), version 7.5
 
 One addon folder. It edits neither ACF, InfMap, Visual Clip nor Prop2Mesh: it wraps their functions at runtime, keeps the originals, and does nothing on maps that are not InfMap maps. Delete the folder and you are back to stock behaviour.
 
@@ -9,6 +9,36 @@ Labels used everywhere (here and in the headers of every `.lua` file):
 - **SEEN** = read in the real source, or run in the test harness against the real files.
 - **KNOWN** = standard GMod / Source behaviour that I did not re-check.
 - **GUESS** = inference. Only a real game can confirm it.
+
+## What changed in version 7.5 (gm_infmap_kirovskoe: terrain and buildings invisible, caused by three hooks)
+
+*(Version 7.4 only added the hold-back setting that found it; 7.5 is the fix.)*
+
+**The problem.** On `gm_infmap_kirovskoe` (multiplayer, local listen server and a normal server) the buildings and the ground near you became invisible, in chunk-sized pieces, while the far terrain stayed; windows were still visible and collision worked. Other InfMap maps were fine, and so was the map with this addon removed.
+
+**How it was found (everything here SEEN in your tests and pastes):**
+
+1. Commenting out the `cl_*` includes fixed it; `cl_origin` alone: fine; `cl_render` alone: broken. `cl_render.lua` is byte-identical in every build from 6.0 to 7.3, so the "6.1 was fine" memory could not be about this file.
+2. `acf_infmap_entdebug kir`: all `kir_` entities are `kir_collider` (30, the nearest ten in your own chunk), scripted, none wrapped by InfMap. The `acf_infmap_cl_render_fix` / `_draw` / `_bounds` switches (which turn the *work* off but leave every hook installed) did not bring the terrain back.
+3. The new setting `acf_infmap_cl_render_hold` leaves parts of the file out of the game altogether. `all`: fine. `passhooks scenehook boundswrap`: fine (so `chunkwrap`, `frame`, `created` and `timer` are harmless). `chunkwrap` alone: broken (so the Draw route is not the cause; it needs `chunkwrap`). **`passhooks` alone: fixed.**
+
+**The culprit: three `hook.Add` calls** in 7.3 and earlier (`PreDrawOpaqueRenderables`, `PreDrawTranslucentRenderables`, `PostDrawTranslucentRenderables`, all named `ACFInfMapCompat_Pass`). Their bodies only set a flag and return nothing, so they cannot change what anything draws. (SEEN: `cl_replay.lua` already adds one hook to `PostDrawTranslucentRenderables`, and the map is fine with that one.)
+
+**Why (GUESS, not confirmed):** GMod's `hook.Call` runs an event's hooks in the order of `pairs()` over its table, which Lua does not define, and a new key can move the others. If the map (or something it loads) draws in more than one hook of one of these events and only works in the order it happened to get, three more keys can put it in the other order. A near/far layering that depends on draw order would show exactly your picture (far terrain on top of the near pieces, translucent windows still visible). If that is right, the bug is a latent order dependence in the map; this addon cannot fix the map, only avoid disturbing it.
+
+**The fix (`cl_render.lua`):** the draw pass is no longer learned from hooks. `hook.Call` calls the gamemode's own function of the same name after the hooks (and only if none of them returned a value), so the addon wraps `GAMEMODE.PreDrawOpaqueRenderables`, `GAMEMODE.PreDrawTranslucentRenderables` and `GAMEMODE.PostDrawTranslucentRenderables`. Those are fields of the gamemode table, not keys of any hook table, so **this file now adds no key to those three hook tables** (tested: same number of keys as without the addon). The function that was there is still called, with the same arguments and return value. It needs the gamemode, so it installs at `Initialize` if it is too early at load, and the half-second scan wraps it again if somebody replaces the function.
+
+**How to check the guess:** `acf_infmap_hooklist` prints the hook names of the draw events, `RenderScene` and `PreRender` in the order GMod runs them. Paste it from the working state (default) and, if you want to see the cause, after `acf_infmap_cl_render_passmode hooks` and `retry` (the old behaviour: the three hooks are added again and the terrain should vanish again). If the order of the *other* names differs between the two prints, the guess is confirmed; if it does not, the guess is wrong and the cause is something else about those three hooks existing.
+
+**Settings and commands:**
+
+- `acf_infmap_cl_render_hold` (you, default empty): names of `cl_render` parts NOT to install: `passhooks` (now: the draw-pass detection), `scenehook`, `boundswrap`, `chunkwrap`, `frame`, `created`, `timer`, or `all`; names separated by spaces, commas or semicolons, any case. Read when the parts are installed, so `retry` after changing it. Held parts are listed in the load message, `acf_infmap_status` and `acf_infmap_renderdebug`. A diagnostic tool (version 7.4), kept because it is how this was found.
+- `acf_infmap_cl_render_passmode` (you, default `gamemode`): `hooks` = the 7.3 behaviour, for the comparison above. Read when installed; `retry` after changing it.
+- `acf_infmap_hooklist` (client command): see above. `acf_infmap_status` shows `draw pass detection  wrapped (gamemode functions, no hook added)`.
+
+**Tests:** render harness 334 checks (277 in 7.3, 318 in 7.4), main harness 509. The mock now behaves like `hook.Call`: after the hooks, the gamemode's function of the same name is called, unless a hook returned a value. Mutation testing: 36 breaks of the hold-back code (33 caught first time; 2 survived and I wrote checks for both; 1 did not compile and was replaced; all caught) and 28 breaks of the new pass detection (all 28 caught by the first run; three of them by a crash of the test run rather than a failed check).
+
+**What this does not prove:** that the map really depends on hook order (GUESS above), that the gamemode's functions are called the way the harness and the GMod `hook.lua` I remember say (KNOWN, not re-read in this session), and that no other part of the file perturbs something else the map does in the same way. `frame`, `created`, `timer` and `chunkwrap` were installed in the run that was fine (all of them except `passhooks`, in the run "passhooks"), so they are not the cause on this map.
 
 ## What changed in version 7.3 (ACF entities in other chunks were drawn too far away: the engine origin)
 
@@ -391,6 +421,8 @@ The menu (Spawn menu, Utilities, ACF InfMap, Settings) shows all of these. **You
 | `acf_infmap_cl_visclip_range` | you | 12 | Chunks (1 to 100). A prop this close to you is checked once for missing clips |
 | `acf_infmap_cl_render_draw` | you | 1 | 1 = in other chunks, run a scripted entity's own `Draw` / `DrawTranslucent` (lazer beams, glows, overlays). 0 = InfMap's `DrawModel`-only wrapper |
 | `acf_infmap_cl_render_bounds` | you | 1 | 1 = shift render boxes that entities in other chunks set in world coordinates back into their own frame. 0 = stock |
+| `acf_infmap_cl_render_passmode` | you | gamemode | Diagnostics, version 7.5. `gamemode` = learn the draw pass from the gamemode's own PreDraw/PostDraw functions (adds no hook). `hooks` = the 7.3 way (three hooks); on gm_infmap_kirovskoe that made the terrain invisible. Read when installed: `retry` after changing it |
+| `acf_infmap_cl_render_hold` | you | (empty) | Diagnostics, version 7.4. Names of `cl_render` parts NOT to install (`passhooks scenehook boundswrap chunkwrap frame created timer`, or `all`), read when the parts are installed: change it, then `retry` |
 | `acf_infmap_cl_origin_fix` | you | 1 | 1 = `ENT:CalcAbsolutePosition` of ACF's scalable entities answers in the entity's own chunk frame, so the engine keeps the right origin (lazers drawn too far away, version 7.3). 0 = stock |
 | `acf_infmap_fix_visclip` | server | 1 | 0 = the server ignores clip requests (stock Visual Clip) |
 | `acf_infmap_cl_replay` | you | 1 | 1 = show effects the engine cannot place (replayed from ACF's own effect code). 0 = drop them |
@@ -413,6 +445,7 @@ Each fix has its own switch, so a misbehaving session can be bisected: turn one 
 |---|---|---|
 | server + client | `acf_infmap_status` | Which functions are wrapped, counters, settings, bullets in flight, far-effect, render and visual clip state |
 | client | `acf_infmap_renderdebug` | The render fix: how many entities it watches, the nearest wrapped ones with their own override, each Prop2Mesh mesh (its local offset from `linkpos`, chunk, override, engine draws), how many meshes are at the wrong position or in another chunk but unwrapped right now, how many props were asked about |
+| client | `acf_infmap_hooklist` | The hook names of the draw events, `RenderScene` and `PreRender` in the order GMod runs them, which gamemode functions this addon wraps, and the draw pass mode (version 7.5) |
 | client | `acf_infmap_entdebug <part of a class name>` | For the nearest entities of that class (try `lazer` or `gun`): chunk, Draw / DrawTranslucent, render group, InfMap's stored render box and how far off-centre it is, wrapper state, Draw route, engine calls, and (7.3) whether `CalcAbsolutePosition` is wrapped and how far the engine's position is from the one the server networked |
 | server (superadmin, or the server console) | `acf_infmap_config_reload` | Re-reads `lua/acf_infmap_compat/config.lua` and prints what each section now says: the seconds each caliber gets (13.2, 20, 30, 40, 55, 70, 85, 120, 155 mm) and the Wire camera and E2 ranger reach, and any mistake it found in the file |
 | client | `acf_infmap_fartest [metres]` | A real ACF explosion that far ahead of you (default 1500) |
@@ -429,16 +462,19 @@ Each fix has its own switch, so a misbehaving session can be bisected: turn one 
 4. **Editing the lifetime.** Change a number in `lua/acf_infmap_compat/config.lua`, then `acf_infmap_config_reload` in the server console and read the printed table. If it prints the old numbers, restart the server (GUESS list, item 28).
 5. **The dupe test** from version 5 is unchanged.
 6. **Version 7.3, the lazers.** Stand a chunk or two away from a firing lazer and a gun, run `acf_infmap_entdebug acf_lazer` and `acf_infmap_entdebug acf_gun` and look at the `CalcAbsolutePosition` line of each. `the same` and a lazer that is now where it should be: done. `DIFFERENT by ... chunks`: paste it. `the same` and still too far: the cause is elsewhere, paste the whole output.
+7. **Version 7.5, the Kirovskoe terrain.** Install, leave `acf_infmap_cl_render_hold` empty (`acf_infmap_cl_render_hold ""`), join the map: the buildings and the ground should stay. Run `acf_infmap_hooklist` and paste it. Optional, to test the cause: `acf_infmap_cl_render_passmode hooks`, `retry`, `acf_infmap_hooklist` again (the terrain should vanish again), then `acf_infmap_cl_render_passmode gamemode` and `retry`.
 
 ## What was tested, and how
 
 Two harnesses, both kept in my workspace (not in this zip), both running **real** third-party files against a mock of the GMod API.
 
 - **`test_render_compat.lua`** runs the real InfMap files (`sh_inf_functions`, `sh_inf_networking`, `cl_inf_detours`, `cl_inf_chunks`), the real Visual Clip client and server files, the real Prop2Mesh `cl_init.lua` and ACF's real `overrides_cl.lua`, translated from GLua syntax to Lua only (no behaviour change), against an engine model (entities, parenting with the SDK's world-to-local rule, render bounds and culling against the +-16384 box, opaque and translucent passes with or without flags, camera and clip stacks, networked entities and NULL for unknown ones, hooks, timers). Every scenario runs **twice: STOCK (the addons alone) and FIXED (plus this addon)**. The STOCK runs reproduce each root cause from the real code (for example a Prop2Mesh child at engine position (16384, 0, 20) instead of (2050, 0, 20), a lazer three chunks away with no beam, a firing lazer whose cached box is 60000 units off). The lazer is a stand-in written from the draw code in your `cl_init.lua` (model in `Draw`, beam and glow in `DrawTranslucent`, box set in `Think`), not the file itself. **277 checks pass** in version 7.3 (195 in 7.2: 67 new for the engine origin, 15 more written after the mutation run below).
-- **`test_acf_infmap_compat.lua`** runs this addon's files with ACF's real traces, ballistics, sounds, effects (`acf_bullet_effect`, `acf_explosion`, `acf_impact`) and loader. **509 checks pass** in version 7.3 (504 in 7.2, 430 in 7.1, 359 in 7.0) (it was 499 in 6.7.1; the checks of the removed shot report, test shells, crate diagnostics and mismatch reports were removed with them; version 7.0 adds the lifetime, config and reload checks listed above).
+- **`test_acf_infmap_compat.lua`** runs this addon's files with ACF's real traces, ballistics, sounds, effects (`acf_bullet_effect`, `acf_explosion`, `acf_impact`) and loader. **509 checks pass** in versions 7.3 to 7.5 (504 in 7.2, 430 in 7.1, 359 in 7.0) (it was 499 in 6.7.1; the checks of the removed shot report, test shells, crate diagnostics and mismatch reports were removed with them; version 7.0 adds the lifetime, config and reload checks listed above).
 - **Mutation testing:** I broke the addon on purpose and ran the checks against each broken copy: 63 breaks in the render and clip code and 79 in the rest for versions up to 6.7.1, 57 for the 7.0 code, 61 for the 7.1 code 52 for the 7.2 code and 63 for the 7.3 code (54 in `cl_origin.lua`, 9 in its wiring: autorun, install order, menu, `entdebug`; all listed above; the 7.0 config reader moved into `sv_config.lua` in 7.1 and its breaks were redone there). **All are caught by at least one check, except one break I marked as equivalent** (running the Prop2Mesh sweep before the override guard: since version 5.1 the guard routes wrapped entities itself, so both orders end in the same state in the same frame). Re-running the suites after the version 5.1 edits also showed that six of my own breaks no longer matched the code (they were being skipped, not caught) and that one new check passed only some of the time because two hooks of the same tick have no defined order. I rewrote the breaks and made the check order-independent before counting anything.
 
 **Version 7.3 mutation result, as it happened:** of the 63 breaks, 44 were caught by the first run and **19 survived**. For 16 of them I wrote new checks (a table error value thrown on unchanged; your chunk not known yet; one wrapper per function shared by class table and entity; an invalid entity left alone; the `Initialize` and `InitPostEntity` hooks; a scan that fails does not escape the timer; the status counting entities; the report on the y and z axes and for an entity without the function; `entdebug` surviving a failing report; the installer running again after `acf_reload`) and re-ran those 16: all are now caught. **3 remain, which I judge equivalent:** (a) `IsValid(Me) and Me.CHUNK_OFFSET` without the `IsValid` (KNOWN, not re-checked: indexing a NULL entity gives nil, so the result is the same); (b) `cl_origin` listed before `cl_render` in the install order (the two installers do not depend on each other); (c) the counter names `OriginCalls`/`OriginErrors` declared in `sh_core.lua` (`cl_origin.lua` declares them itself; the shared list only adds two zeros to the server's counters line).
+
+**Versions 7.4 and 7.5 mutation results:** 36 breaks of the hold-back code: 33 caught by the first run, 2 survived (the order of the held parts in the list; the text of the status line when nothing is held) and got new checks, 1 did not compile and was replaced; all 36 are caught. 28 breaks of the draw-pass replacement (pass values per event, the gamemode function not called / its return value or arguments or self changed, wrapped twice, wrapper not recorded, missing gamemode, the repair by the scan, the install order, the listing, the hold and the pass mode): all 28 caught by the first run.
 
 What that proves: the logic does what the headers say against the real source of all three addons, in the cases above. What it cannot prove: that real GMod's engine behaves the way the model assumes (list below), that your Workshop versions equal the sources I read, and nothing about how anything looks.
 
@@ -502,6 +538,12 @@ Version 7.2:
 36. That the real E2 behaves like the mock for chips compiled after the install (SEEN in the compiler source; not run in a game).
 37. That the engine accepts a hull piece that starts exactly where the previous one ended, like item 33 does for lines.
 38. That the hologram script uses the ranger functions listed above (`ranger`, `rangerOffset`, `rangerAngle`, the hull versions) and not `entity:eyeTrace()` or `entity:eyeTraceCursor()`. If it still goes wrong, paste its ranger lines.
+
+Version 7.5:
+
+43. That the map's terrain vanished because of the ORDER in which GMod runs hooks (the new keys in three hook tables reshuffled something the map depends on). SEEN: the three hooks are the cause on this map. GUESS: why. `acf_infmap_hooklist` before and after `acf_infmap_cl_render_passmode hooks` tests it.
+44. That `GAMEMODE` is the table `hook.Call` takes the gamemode's functions from, and that the engine's draw events go through `hook.Call` (so `GAMEMODE.PreDrawTranslucentRenderables` is called after the hooks). KNOWN from the GMod wiki (`GM:PreDrawOpaqueRenderables` etc. are documented overrides); not re-read in this session. If wrong, the pass flag never changes and lazer beams in other chunks are not drawn (the flags the engine hands to `RenderOverride` still serve as the second signal).
+45. That `retry` on a listen server reloads the client's Lua (so every held part really is absent afterwards). Your results (a different outcome for each hold) are consistent with it.
 
 Version 7.3:
 
