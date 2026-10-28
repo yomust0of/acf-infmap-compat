@@ -1,0 +1,2 @@
+just trying to get infmap to work with acf, seems infmap still hates the idea of more than a couple acf vehicles existing at one time generating chunks. improvements on the backend of infmap seems required, guess ill look into infmap2 or maybe doing something else later.
+this fixes most big bugs with infmap1 and acf contraptions, though its still not perfect, and most of it was vibe coded, i understand systems, but honestly, not enough to do this all myself. have fun, seems to do best with two vehicles at most, acf cars drive really nice on kirovskoe. go check it out.
